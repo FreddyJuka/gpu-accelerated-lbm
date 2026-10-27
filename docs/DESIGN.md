@@ -13,6 +13,7 @@ and the reasoning for each one. It is updated whenever a decision changes.
 | Precision | Template parameters `<Storage, Compute>`; FP64 for validation, FP32 + DDF-shifting for performance |
 | Memory layout | Structure of Arrays (SoA), x as the fastest index |
 | Propagation | Fused stream-collide kernel, pull scheme, two buffers (A-B), behind an interface |
+| Lattice constants | Local `constexpr` arrays inside `LBM_HD` accessors; loops over directions fully unrolled |
 | Target hardware | NVIDIA GeForce RTX 3050 Laptop (Ampere, sm_86, 4 GB) |
 
 ## 1. Scope and lattice
@@ -93,6 +94,27 @@ limiting.
 - CPU reference implementation acts as the oracle for the GPU kernels.
 - GitHub-hosted runners have no GPU: CI builds the CUDA code and runs CPU tests
   only. GPU tests are run locally.
+
+## 7. Lattice constants in host and device code
+
+nvcc rejects `static constexpr` member arrays in device code
+("identifier ... is undefined in device code"), regardless of loop unrolling:
+the check happens in the front end, before optimization. Lattice constants are
+therefore stored as local `constexpr` arrays inside `LBM_HD` accessor functions
+(`cx(q)`, `cy(q)`, `opp(q)`, `w<T>(q)`). This keeps a single source of truth
+for host and device code.
+
+Loops over lattice directions must be fully unrolled (`LBM_UNROLL`). Measured
+with nvcc 12.0 on sm_86, using a kernel that computes moments of the D2Q9
+weights:
+
+| Loop | Local-memory instructions (LDL/STL) |
+|---|---|
+| Fully unrolled | 0 |
+| Not unrolled (`#pragma unroll 1`) | 16 |
+
+With full unrolling every index is a compile-time constant and the values are
+folded into immediates. Without it, the arrays are placed in local memory.
 
 ## References
 
