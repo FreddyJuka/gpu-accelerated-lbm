@@ -62,6 +62,13 @@ class D2Q9Moments : public ::testing::Test {};
 using PrecisionTypes = ::testing::Types<float, double>;
 TYPED_TEST_SUITE(D2Q9Moments, PrecisionTypes);
 
+TYPED_TEST(D2Q9Moments, InverseSoundSpeedIsExact) {
+    using T = TypeParam;
+    EXPECT_EQ(L::template inv_cs2<T>(), T(3));
+    EXPECT_NEAR(L::template inv_cs2<T>() * L::template cs2<T>(), T(1),
+                std::numeric_limits<T>::epsilon());
+}
+
 TYPED_TEST(D2Q9Moments, ZerothMomentIsOne) {
     using T = TypeParam;
     T sum = T(0);

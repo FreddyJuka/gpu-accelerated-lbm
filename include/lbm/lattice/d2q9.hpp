@@ -52,6 +52,13 @@ struct D2Q9 {
     LBM_HD static constexpr T cs2() {
         return T(1) / T(3);
     }
+
+    // Inverse of the lattice speed of sound squared. Exact in every
+    // precision, unlike cs2 = 1/3.
+    template <typename T>
+    LBM_HD static constexpr T inv_cs2() {
+        return T(3);
+    }
 };
 
 } // namespace lbm
