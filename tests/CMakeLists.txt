@@ -11,3 +11,7 @@ target_link_libraries(lbm_tests PRIVATE
   GTest::gtest_main)
 
 gtest_discover_tests(lbm_tests)
+
+# Compile-only check of the device code path (never linked or launched).
+add_library(lbm_device_compile_check OBJECT device_compile_check.cu)
+target_link_libraries(lbm_device_compile_check PRIVATE lbm::lbm lbm_warnings)

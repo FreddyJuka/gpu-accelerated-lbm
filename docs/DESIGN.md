@@ -116,6 +116,11 @@ weights:
 With full unrolling every index is a compile-time constant and the values are
 folded into immediates. Without it, the arrays are placed in local memory.
 
+`LBM_UNROLL` expands to `_Pragma("unroll")` only in the device pass
+(`__CUDA_ARCH__`). nvcc compiles the host pass with g++, which does not
+recognize the pragma and warns about it under `-Wall`; `__CUDACC__` alone is
+not sufficient because it is defined in both passes.
+
 ## References
 
 - I. Ginzburg, F. Verhaeghe, D. d'Humieres, "Two-relaxation-time lattice
