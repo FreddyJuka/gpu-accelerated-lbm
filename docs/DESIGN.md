@@ -137,6 +137,23 @@ versus 72 B of FP32 populations per node (D2Q9).
 Periodic wrap uses a conditional add/subtract instead of `%`, which is cheaper
 on the GPU. It is valid for single-step neighbours only (-1 <= x <= nx).
 
+## 9. GPU execution and verification
+
+The CUDA kernel uses one thread per node, with 128-thread blocks along x and
+one grid row per y. Device memory is owned by a move-only RAII buffer
+(`DeviceBuffer`), and CUDA errors are raised as exceptions
+(`LBM_CUDA_CHECK`). The CPU reference and the GPU kernel share the same node
+function (`pull_stream_collide_periodic`), so they perform the same operations
+in the same order. The grid's y dimension is ny, which CUDA limits (65535 on
+current architectures) while `Grid2D` accepts larger values; the launcher
+queries the device limit and rejects larger grids with `std::invalid_argument`.
+
+The GPU tests are compiled with `--fmad=false` and compared bitwise against
+the CPU reference. Production builds keep nvcc's default FMA contraction; a
+bounded comparison with FMA enabled is planned once the error-bound helpers
+move to a shared test header. Measured: with FMA contraction enabled, the
+exact CPU-vs-GPU tests fail in both float and double.
+
 ## References
 
 - I. Ginzburg, F. Verhaeghe, D. d'Humieres, "Two-relaxation-time lattice
