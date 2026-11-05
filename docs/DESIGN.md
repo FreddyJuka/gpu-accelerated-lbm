@@ -14,6 +14,8 @@ and the reasoning for each one. It is updated whenever a decision changes.
 | Memory layout | Structure of Arrays (SoA), x as the fastest index |
 | Propagation | Fused stream-collide kernel, pull scheme, two buffers (A-B), behind an interface |
 | Lattice constants | Local `constexpr` arrays inside `LBM_HD` accessors; loops over directions fully unrolled |
+| Indexing | 32-bit int, validated Q*N <= INT32_MAX |
+| Node types | uint8_t flag array per node |
 | Target hardware | NVIDIA GeForce RTX 3050 Laptop (Ampere, sm_86, 4 GB) |
 
 ## 1. Scope and lattice
@@ -120,6 +122,20 @@ folded into immediates. Without it, the arrays are placed in local memory.
 (`__CUDA_ARCH__`). nvcc compiles the host pass with g++, which does not
 recognize the pragma and warns about it under `-Wall`; `__CUDACC__` alone is
 not sufficient because it is defined in both passes.
+
+## 8. Grid, indexing and node types
+
+Indices are 32-bit `int`. `Grid2D` validates in its constructor, in 64-bit
+arithmetic, that `Q*N <= INT32_MAX` (N = nx*ny), so no index computed by
+`idx()` can overflow. With 4 GB of VRAM the limit cannot be reached: FP32 with
+two buffers holds at most ~5e8 population values, below the 2^31 - 1 ~ 2.1e9
+limit.
+
+Node types are stored as a `uint8_t` flag array (`NodeType`), ~1 B per node
+versus 72 B of FP32 populations per node (D2Q9).
+
+Periodic wrap uses a conditional add/subtract instead of `%`, which is cheaper
+on the GPU. It is valid for single-step neighbours only (-1 <= x <= nx).
 
 ## References
 

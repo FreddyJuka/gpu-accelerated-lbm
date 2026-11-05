@@ -1,4 +1,4 @@
-// Compile-only check: the lattice, equilibrium, moments and TRT code must
+// Compile-only check: the lattice, grid, equilibrium, moments and TRT code must
 // compile in device code for float and double without warnings. The kernels
 // are never launched; results are written to global memory so that the code
 // is not optimized away and the generated SASS can be inspected.
@@ -6,6 +6,7 @@
 #include "lbm/collision/trt.hpp"
 #include "lbm/config.hpp"
 #include "lbm/equilibrium.hpp"
+#include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
 
@@ -51,11 +52,29 @@ __global__ void check_trt(lbm::TRT<T> trt, T* f, T* omegas) {
     omegas[2 * i + 1] = trt.omega_minus();
 }
 
+// Grid is passed by value, as in the production kernels. Reads one population
+// from the periodic neighbour (pull scheme) of node (x, y).
+template <typename T>
+__global__ void check_grid(lbm::Grid2D<L> grid, const T* f, T* out) {
+    const int x = static_cast<int>(threadIdx.x);
+    const int y = static_cast<int>(threadIdx.y);
+    T acc = T(0);
+    LBM_UNROLL
+    for (int q = 0; q < L::Q; ++q) {
+        const int xs = grid.wrap_x(x - L::c(q, 0));
+        const int ys = grid.wrap_y(y - L::c(q, 1));
+        acc += f[grid.idx(q, xs, ys)];
+    }
+    out[grid.node(x, y)] = acc;
+}
+
 template __global__ void check_equilibrium<float>(const float*, const float*, float*);
 template __global__ void check_equilibrium<double>(const double*, const double*, double*);
 template __global__ void check_moments<float>(const float*, float*, float*);
 template __global__ void check_moments<double>(const double*, double*, double*);
 template __global__ void check_trt<float>(lbm::TRT<float>, float*, float*);
 template __global__ void check_trt<double>(lbm::TRT<double>, double*, double*);
+template __global__ void check_grid<float>(lbm::Grid2D<L>, const float*, float*);
+template __global__ void check_grid<double>(lbm::Grid2D<L>, const double*, double*);
 
 } // namespace
