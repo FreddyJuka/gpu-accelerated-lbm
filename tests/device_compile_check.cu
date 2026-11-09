@@ -1,4 +1,4 @@
-// Compile-only check: the lattice, grid, equilibrium, moments, TRT and pull step code must
+// Compile-only check: the lattice, grid, equilibrium, moments, TRT (unforced and forced) and pull step code must
 // compile in device code for float and double without warnings. The kernels
 // are never launched; results are written to global memory so that the code
 // is not optimized away and the generated SASS can be inspected.
@@ -6,6 +6,7 @@
 #include "lbm/collision/trt.hpp"
 #include "lbm/config.hpp"
 #include "lbm/equilibrium.hpp"
+#include "lbm/force.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
@@ -53,6 +54,29 @@ __global__ void check_trt(lbm::TRT<T> trt, T* f, T* omegas) {
     omegas[2 * i + 1] = trt.omega_minus();
 }
 
+// Forced TRT (Guo scheme with uniform force); the policy is passed by value as
+// part of the collision object.
+template <typename T>
+__global__ void check_trt_forced(lbm::TRT<T, lbm::UniformForce<T, L::D>> trt, T* f) {
+    const int i = static_cast<int>(threadIdx.x);
+    T floc[L::Q];
+    LBM_UNROLL
+    for (int q = 0; q < L::Q; ++q) floc[q] = f[L::Q * i + q];
+    trt.template collide<L>(floc);
+    LBM_UNROLL
+    for (int q = 0; q < L::Q; ++q) f[L::Q * i + q] = floc[q];
+}
+
+// Forced pull step: node function with the forced TRT.
+template <typename T>
+__global__ void check_pull_step_forced(lbm::Grid2D<L> grid, const lbm::NodeType* flags,
+                                       lbm::TRT<T, lbm::UniformForce<T, L::D>> trt, const T* src,
+                                       T* dst) {
+    const int x = static_cast<int>(threadIdx.x);
+    const int y = static_cast<int>(threadIdx.y);
+    lbm::pull_stream_collide<L, T>(grid, flags, src, dst, trt, x, y);
+}
+
 // Grid is passed by value, as in the production kernels. Reads one population
 // from the periodic neighbour (pull scheme) of node (x, y).
 template <typename T>
@@ -88,6 +112,15 @@ template __global__ void check_pull_step<float>(lbm::Grid2D<L>, const lbm::NodeT
                                                 const float*, float*);
 template __global__ void check_pull_step<double>(lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<double>,
                                                  const double*, double*);
+template __global__ void check_trt_forced<float>(lbm::TRT<float, lbm::UniformForce<float, 2>>, float*);
+template __global__ void check_trt_forced<double>(lbm::TRT<double, lbm::UniformForce<double, 2>>,
+                                                  double*);
+template __global__ void check_pull_step_forced<float>(lbm::Grid2D<L>, const lbm::NodeType*,
+                                                       lbm::TRT<float, lbm::UniformForce<float, 2>>,
+                                                       const float*, float*);
+template __global__ void check_pull_step_forced<double>(
+    lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<double, lbm::UniformForce<double, 2>>,
+    const double*, double*);
 template __global__ void check_grid<float>(lbm::Grid2D<L>, const float*, float*);
 template __global__ void check_grid<double>(lbm::Grid2D<L>, const double*, double*);
 

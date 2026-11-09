@@ -37,4 +37,34 @@ LBM_HD inline void moments_shifted(const T (&f)[L::Q], T& drho, T (&u)[L::D]) {
     for (int d = 0; d < L::D; ++d) u[d] = j[d] * inv_rho;
 }
 
+// Moments with a body force F (Guo scheme): identical to moments_shifted except
+// that the velocity is the half-force velocity
+//
+//   u_d = (j_d + F_d / 2) / rho.
+//
+// drho and the summation are unchanged; one division per call.
+template <typename L, typename T>
+LBM_HD inline void moments_shifted_forced(const T (&f)[L::Q], const T (&F)[L::D], T& drho,
+                                          T (&u)[L::D]) {
+    T sum = T(0);
+    LBM_UNROLL
+    for (int q = 0; q < L::Q; ++q) sum += f[q];
+
+    T j[L::D];
+    LBM_UNROLL
+    for (int d = 0; d < L::D; ++d) j[d] = T(0);
+
+    LBM_UNROLL
+    for (int q = 0; q < L::Q; ++q) {
+        LBM_UNROLL
+        for (int d = 0; d < L::D; ++d) j[d] += T(L::c(q, d)) * f[q];
+    }
+
+    const T inv_rho = T(1) / (T(1) + sum);
+
+    drho = sum;
+    LBM_UNROLL
+    for (int d = 0; d < L::D; ++d) u[d] = (j[d] + T(0.5) * F[d]) * inv_rho;
+}
+
 } // namespace lbm

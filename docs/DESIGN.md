@@ -17,6 +17,7 @@ and the reasoning for each one. It is updated whenever a decision changes.
 | Indexing | 32-bit int, validated Q*N <= INT32_MAX |
 | Node types | uint8_t flag array per node |
 | Walls | Halfway bounce-back in the gather; neighbour flags read at runtime |
+| Body force | Guo scheme, TRT-split, uniform force policy |
 | Target hardware | NVIDIA GeForce RTX 3050 Laptop (Ampere, sm_86, 4 GB) |
 
 ## 1. Scope and lattice
@@ -169,6 +170,28 @@ Neighbour flags are read at runtime from the node-type array. A precomputed
 link mask is a possible later optimization if profiling shows that the flag
 traffic matters.
 
+## 11. Body force
+
+A body force F is applied with the scheme of Guo, Zheng and Shi (2002). The
+macroscopic velocity entering the equilibrium is the half-force velocity
+`u = (j + F/2) / rho` (`moments_shifted_forced`), and the forcing term
+`S_q = w_q [ (c_q - u)/cs2 + (c_q . u) c_q / cs2^2 ] . F` is added to the
+collision with a relaxation-dependent prefactor. For TRT the source is split
+into its antisymmetric part (odd under q -> opp(q), relaxed with omega_minus)
+and its symmetric part (even, relaxed with omega_plus):
+
+    out_q = f_q - omega_plus fneq_plus_q - omega_minus fneq_minus_q
+            + (1 - omega_plus/2) s_sym_q + (1 - omega_minus/2) s_anti_q.
+
+In exact arithmetic the collision conserves mass and changes the momentum by
+exactly F per step. The split avoids the divisions of a generic
+rate-dependent prefactor.
+
+The force is a template policy of the collision: `TRT<T, Force>`, with
+`NoForce` (default) compiling to the unforced collision (identical generated
+code) and `UniformForce<T, D>` for a uniform constant force. Only the uniform
+force is implemented.
+
 ## References
 
 - I. Ginzburg, F. Verhaeghe, D. d'Humieres, "Two-relaxation-time lattice
@@ -182,3 +205,5 @@ traffic matters.
 - U. Ghia, K. N. Ghia, C. T. Shin, "High-Re solutions for incompressible flow
   using the Navier-Stokes equations and a multigrid method", J. Comput. Phys.
   48 (1982).
+- Z. Guo, C. Zheng, B. Shi, "Discrete lattice effects on the forcing term in
+  the lattice Boltzmann method", Phys. Rev. E 65, 046308 (2002).
