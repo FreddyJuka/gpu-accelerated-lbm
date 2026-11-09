@@ -5,7 +5,8 @@ add_executable(lbm_tests
   test_moments.cpp
   test_collision_trt.cpp
   test_grid.cpp
-  test_step_cpu.cpp)
+  test_step_cpu.cpp
+  test_bounce_back.cpp)
 
 target_link_libraries(lbm_tests PRIVATE
   lbm::lbm

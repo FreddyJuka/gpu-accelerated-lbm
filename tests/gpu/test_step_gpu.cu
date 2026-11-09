@@ -1,7 +1,7 @@
-// Exact CPU-vs-GPU comparison of the periodic pull stream-collide step.
+// Exact CPU-vs-GPU comparison of the pull stream-collide step with bounce-back.
 //
 // The GPU kernel and the CPU reference call the same node function
-// (pull_stream_collide_periodic), so with identical IEEE operations in the
+// (pull_stream_collide), so with identical IEEE operations in the
 // same order the results are bitwise equal. This target is compiled with
 // --fmad=false to rule out fused multiply-add contraction on the device (see
 // tests/CMakeLists.txt). All comparisons are EXPECT_EQ.
@@ -53,6 +53,27 @@ std::vector<T> nonuniform_field(const Grid& g) {
     return f;
 }
 
+// Geometries: G1 = channel (walls on rows y = 0 and y = ny-1), G2 = a single
+// interior wall node at (nx/2, ny/2).
+enum class Geometry { Channel, SingleWall };
+const Geometry kGeometries[] = {Geometry::Channel, Geometry::SingleWall};
+
+std::vector<lbm::NodeType> make_flags(const Grid& g, Geometry geo) {
+    std::vector<lbm::NodeType> flags(static_cast<std::size_t>(g.num_nodes()), lbm::NodeType::Fluid);
+    for (int y = 0; y < g.ny(); ++y)
+        for (int x = 0; x < g.nx(); ++x) {
+            const bool wall = (geo == Geometry::Channel) ? (y == 0 || y == g.ny() - 1)
+                                                         : (x == g.nx() / 2 && y == g.ny() / 2);
+            if (wall) flags[static_cast<std::size_t>(g.node(x, y))] = lbm::NodeType::Wall;
+        }
+    return flags;
+}
+
+std::string label(const GridSize& s, Geometry geo) {
+    return std::to_string(s.nx) + "x" + std::to_string(s.ny) +
+           (geo == Geometry::Channel ? " G1" : " G2");
+}
+
 template <typename T>
 void expect_equal(const std::vector<T>& a, const std::vector<T>& b, const std::string& what) {
     ASSERT_EQ(a.size(), b.size());
@@ -70,62 +91,69 @@ TYPED_TEST_SUITE(StepGpu, PrecisionTypes);
 
 } // namespace
 
-// a. One step: GPU equals CPU bitwise.
+// a. One step: GPU equals CPU bitwise, with walls (G1, G2). Both dst buffers
+// start as a copy of the source so that the untouched wall-node values compare
+// equal.
 TYPED_TEST(StepGpu, OneStepMatchesCpu) {
     using T = TypeParam;
-    for (const GridSize s : kSizes) {
-        const Grid g(s.nx, s.ny);
-        const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
-        const std::vector<T> init = nonuniform_field<T>(g);
-        const int n = static_cast<int>(init.size());
+    for (const GridSize s : kSizes)
+        for (const Geometry geo : kGeometries) {
+            const Grid g(s.nx, s.ny);
+            const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
+            const std::vector<T> init = nonuniform_field<T>(g);
+            const std::vector<lbm::NodeType> flags = make_flags(g, geo);
+            const int n = static_cast<int>(init.size());
 
-        std::vector<T> cpu(init.size(), T(-1));
-        lbm::step_periodic_cpu<L, T>(g, init.data(), cpu.data(), trt);
+            std::vector<T> cpu = init;
+            lbm::step_cpu<L, T>(g, flags.data(), init.data(), cpu.data(), trt);
 
-        lbm::DeviceBuffer<T> d_src(n), d_dst(n);
-        d_src.copy_from_host(init.data(), n);
-        const std::vector<T> poison(init.size(), T(-1));
-        d_dst.copy_from_host(poison.data(), n);
-        lbm::step_periodic_gpu<L, T>(g, d_src.data(), d_dst.data(), trt);
-        LBM_CUDA_CHECK(cudaDeviceSynchronize());
-        std::vector<T> gpu(init.size());
-        d_dst.copy_to_host(gpu.data(), n);
+            lbm::DeviceBuffer<T> d_src(n), d_dst(n);
+            lbm::DeviceBuffer<lbm::NodeType> d_flags(g.num_nodes());
+            d_flags.copy_from_host(flags.data(), g.num_nodes());
+            d_src.copy_from_host(init.data(), n);
+            d_dst.copy_from_host(init.data(), n);
+            lbm::step_gpu<L, T>(g, d_flags.data(), d_src.data(), d_dst.data(), trt);
+            LBM_CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<T> gpu(init.size());
+            d_dst.copy_to_host(gpu.data(), n);
 
-        expect_equal(gpu, cpu, std::to_string(s.nx) + "x" + std::to_string(s.ny));
-    }
+            expect_equal(gpu, cpu, label(s, geo));
+        }
 }
 
 // b. 100 steps with alternating buffers on both sides; compared after step 1,
-// 50 and 100.
+// 50 and 100. Both buffer pairs start as copies of the initial field.
 TYPED_TEST(StepGpu, HundredStepsMatchCpu) {
     using T = TypeParam;
-    for (const GridSize s : kSizes) {
-        const Grid g(s.nx, s.ny);
-        const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
-        const std::vector<T> init = nonuniform_field<T>(g);
-        const int n = static_cast<int>(init.size());
+    for (const GridSize s : kSizes)
+        for (const Geometry geo : kGeometries) {
+            const Grid g(s.nx, s.ny);
+            const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
+            const std::vector<T> init = nonuniform_field<T>(g);
+            const std::vector<lbm::NodeType> flags = make_flags(g, geo);
+            const int n = static_cast<int>(init.size());
 
-        std::vector<T> ca = init, cb(init.size(), T(-1));
-        lbm::DeviceBuffer<T> da(n), db(n);
-        da.copy_from_host(init.data(), n);
-        db.copy_from_host(cb.data(), n);
+            std::vector<T> ca = init, cb = init;
+            lbm::DeviceBuffer<T> da(n), db(n);
+            lbm::DeviceBuffer<lbm::NodeType> d_flags(g.num_nodes());
+            d_flags.copy_from_host(flags.data(), g.num_nodes());
+            da.copy_from_host(init.data(), n);
+            db.copy_from_host(init.data(), n);
 
-        std::vector<T> gpu(init.size());
-        for (int step = 1; step <= 100; ++step) {
-            lbm::step_periodic_cpu<L, T>(g, ca.data(), cb.data(), trt);
-            std::swap(ca, cb);
-            lbm::step_periodic_gpu<L, T>(g, da.data(), db.data(), trt);
-            std::swap(da, db);
+            std::vector<T> gpu(init.size());
+            for (int step = 1; step <= 100; ++step) {
+                lbm::step_cpu<L, T>(g, flags.data(), ca.data(), cb.data(), trt);
+                std::swap(ca, cb);
+                lbm::step_gpu<L, T>(g, d_flags.data(), da.data(), db.data(), trt);
+                std::swap(da, db);
 
-            if (step == 1 || step == 50 || step == 100) {
-                LBM_CUDA_CHECK(cudaDeviceSynchronize());
-                da.copy_to_host(gpu.data(), n);
-                expect_equal(gpu, ca,
-                             std::to_string(s.nx) + "x" + std::to_string(s.ny) + " step " +
-                                 std::to_string(step));
+                if (step == 1 || step == 50 || step == 100) {
+                    LBM_CUDA_CHECK(cudaDeviceSynchronize());
+                    da.copy_to_host(gpu.data(), n);
+                    expect_equal(gpu, ca, label(s, geo) + " step " + std::to_string(step));
+                }
             }
         }
-    }
 }
 
 // c. Launcher rejection.
@@ -134,12 +162,17 @@ TYPED_TEST(StepGpu, LauncherRejectsInvalidArguments) {
     const Grid g(7, 5);
     const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
     lbm::DeviceBuffer<T> a(L::Q * g.num_nodes()), b(L::Q * g.num_nodes());
-    auto step = [&](const T* src, T* dst) { lbm::step_periodic_gpu<L, T>(g, src, dst, trt); };
+    lbm::DeviceBuffer<lbm::NodeType> flags(g.num_nodes());
+    const lbm::NodeType* f = flags.data();
+    auto step = [&](const lbm::NodeType* fl, const T* src, T* dst) {
+        lbm::step_gpu<L, T>(g, fl, src, dst, trt);
+    };
 
-    EXPECT_THROW(step(nullptr, b.data()), std::invalid_argument);
-    EXPECT_THROW(step(a.data(), nullptr), std::invalid_argument);
-    EXPECT_THROW(step(nullptr, nullptr), std::invalid_argument);
-    EXPECT_THROW(step(a.data(), a.data()), std::invalid_argument);
+    EXPECT_THROW(step(f, nullptr, b.data()), std::invalid_argument);
+    EXPECT_THROW(step(f, a.data(), nullptr), std::invalid_argument);
+    EXPECT_THROW(step(f, nullptr, nullptr), std::invalid_argument);
+    EXPECT_THROW(step(f, a.data(), a.data()), std::invalid_argument);
+    EXPECT_THROW(step(nullptr, a.data(), b.data()), std::invalid_argument);
 }
 
 // c2. ny above the device's grid y limit is a valid Grid2D but is rejected by
@@ -157,9 +190,10 @@ TYPED_TEST(StepGpu, LauncherRejectsNyAboveGridLimit) {
     const Grid g(1, ny);
     const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
     lbm::DeviceBuffer<T> a(1), b(1);
+    lbm::DeviceBuffer<lbm::NodeType> flags(1);
 
     try {
-        lbm::step_periodic_gpu<L, T>(g, a.data(), b.data(), trt);
+        lbm::step_gpu<L, T>(g, flags.data(), a.data(), b.data(), trt);
         FAIL() << "expected std::invalid_argument";
     } catch (const std::invalid_argument& e) {
         const std::string msg = e.what();

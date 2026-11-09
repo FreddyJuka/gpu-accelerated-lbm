@@ -71,10 +71,11 @@ __global__ void check_grid(lbm::Grid2D<L> grid, const T* f, T* out) {
 
 // One thread per node; Grid2D and TRT are passed by value.
 template <typename T>
-__global__ void check_pull_step(lbm::Grid2D<L> grid, lbm::TRT<T> trt, const T* src, T* dst) {
+__global__ void check_pull_step(lbm::Grid2D<L> grid, const lbm::NodeType* flags, lbm::TRT<T> trt,
+                                const T* src, T* dst) {
     const int x = static_cast<int>(threadIdx.x);
     const int y = static_cast<int>(threadIdx.y);
-    lbm::pull_stream_collide_periodic<L, T>(grid, src, dst, trt, x, y);
+    lbm::pull_stream_collide<L, T>(grid, flags, src, dst, trt, x, y);
 }
 
 template __global__ void check_equilibrium<float>(const float*, const float*, float*);
@@ -83,8 +84,10 @@ template __global__ void check_moments<float>(const float*, float*, float*);
 template __global__ void check_moments<double>(const double*, double*, double*);
 template __global__ void check_trt<float>(lbm::TRT<float>, float*, float*);
 template __global__ void check_trt<double>(lbm::TRT<double>, double*, double*);
-template __global__ void check_pull_step<float>(lbm::Grid2D<L>, lbm::TRT<float>, const float*, float*);
-template __global__ void check_pull_step<double>(lbm::Grid2D<L>, lbm::TRT<double>, const double*, double*);
+template __global__ void check_pull_step<float>(lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<float>,
+                                                const float*, float*);
+template __global__ void check_pull_step<double>(lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<double>,
+                                                 const double*, double*);
 template __global__ void check_grid<float>(lbm::Grid2D<L>, const float*, float*);
 template __global__ void check_grid<double>(lbm::Grid2D<L>, const double*, double*);
 

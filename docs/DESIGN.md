@@ -16,6 +16,7 @@ and the reasoning for each one. It is updated whenever a decision changes.
 | Lattice constants | Local `constexpr` arrays inside `LBM_HD` accessors; loops over directions fully unrolled |
 | Indexing | 32-bit int, validated Q*N <= INT32_MAX |
 | Node types | uint8_t flag array per node |
+| Walls | Halfway bounce-back in the gather; neighbour flags read at runtime |
 | Target hardware | NVIDIA GeForce RTX 3050 Laptop (Ampere, sm_86, 4 GB) |
 
 ## 1. Scope and lattice
@@ -143,7 +144,7 @@ The CUDA kernel uses one thread per node, with 128-thread blocks along x and
 one grid row per y. Device memory is owned by a move-only RAII buffer
 (`DeviceBuffer`), and CUDA errors are raised as exceptions
 (`LBM_CUDA_CHECK`). The CPU reference and the GPU kernel share the same node
-function (`pull_stream_collide_periodic`), so they perform the same operations
+function (`pull_stream_collide`), so they perform the same operations
 in the same order. The grid's y dimension is ny, which CUDA limits (65535 on
 current architectures) while `Grid2D` accepts larger values; the launcher
 queries the device limit and rejects larger grids with `std::invalid_argument`.
@@ -153,6 +154,20 @@ the CPU reference. Production builds keep nvcc's default FMA contraction; a
 bounded comparison with FMA enabled is planned once the error-bound helpers
 move to a shared test header. Measured: with FMA contraction enabled, the
 exact CPU-vs-GPU tests fail in both float and double.
+
+## 10. Boundary conditions
+
+Stationary walls use halfway bounce-back, applied in the gather phase of the
+pull scheme. The source buffer holds post-collision populations, so when the
+neighbour a population would be pulled from is a wall node, the node instead
+reads its own population in the opposite direction:
+`f_q = src[idx(opp(q), x, y)]`. Wall nodes are never updated; their values in
+the destination buffer are left untouched. Where there are no walls the domain
+stays periodic.
+
+Neighbour flags are read at runtime from the node-type array. A precomputed
+link mask is a possible later optimization if profiling shows that the flag
+traffic matters.
 
 ## References
 
