@@ -34,6 +34,7 @@ endif()
 # Options
 # ---------------------------------------------------------------------------
 option(LBM_BUILD_TESTS "Build unit tests" ON)
+option(LBM_BUILD_APPS "Build the example and measurement applications" ON)
 
 # ---------------------------------------------------------------------------
 # Core library (header-only for now)
@@ -65,4 +66,11 @@ if(LBM_BUILD_TESTS)
   enable_testing()
   include(GoogleTest)
   add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Applications
+# ---------------------------------------------------------------------------
+if(LBM_BUILD_APPS)
+  add_subdirectory(apps)
 endif()
