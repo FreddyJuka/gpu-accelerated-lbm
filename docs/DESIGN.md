@@ -99,6 +99,12 @@ limiting.
 - GitHub-hosted runners have no GPU: CI builds the CUDA code and runs CPU tests
   only. GPU tests are run locally.
 
+The workflow `.github/workflows/ci.yml` runs on `ubuntu-24.04` and installs the
+Ubuntu-packaged `nvidia-cuda-toolkit` (nvcc 12.0, matching the local toolchain).
+CI configures with `LBM_WARNINGS_AS_ERRORS=ON`. Discovery of the GPU tests
+needs no GPU (verified with `CUDA_VISIBLE_DEVICES=""`), so the full build
+succeeds on the runner and `ctest -LE gpu` runs the CPU tests.
+
 ## 7. Lattice constants in host and device code
 
 nvcc rejects `static constexpr` member arrays in device code

@@ -35,6 +35,7 @@ endif()
 # ---------------------------------------------------------------------------
 option(LBM_BUILD_TESTS "Build unit tests" ON)
 option(LBM_BUILD_APPS "Build the example and measurement applications" ON)
+option(LBM_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 
 # ---------------------------------------------------------------------------
 # Core library (header-only for now)
@@ -49,6 +50,15 @@ add_library(lbm_warnings INTERFACE)
 target_compile_options(lbm_warnings INTERFACE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+# Only targets linking lbm_warnings are affected; GoogleTest is not.
+if(LBM_WARNINGS_AS_ERRORS)
+  target_compile_options(lbm_warnings INTERFACE
+    $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+    # nvcc's own warnings, then the host compiler pass
+    $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Werror all-warnings>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Werror>)
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests (GoogleTest via FetchContent, pinned)

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nvidia-cuda-toolkit cmake g++ make
+
+      - name: Print tool versions
+        run: |
+          nvcc --version
+          g++ --version
+          cmake --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DLBM_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CUDA_ARCHITECTURES=86
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      # The GPU tests are built (and their discovery needs no GPU) but not run:
+      # GitHub-hosted runners have no GPU. They are run locally.
+      - name: Test (CPU only)
+        run: ctest --test-dir build -LE gpu --output-on-failure
