@@ -17,7 +17,7 @@ Implemented and verified:
 
 - D2Q9 lattice
 - Shifted equilibrium and moments
-- TRT collision with validated parameters (runtime magic parameter Lambda)
+- TRT collision with validated parameters (runtime magic parameter $\Lambda$)
 - Guo body force, split for TRT, with a uniform force policy
 - Halfway bounce-back walls, selected through per-node flags
 - Periodic domains
@@ -33,7 +33,7 @@ Not done yet: see the [Roadmap](#roadmap).
   [DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)
 - `<Storage, Compute>` precision templates with DDF-shifting:
   [section 3](docs/DESIGN.md#3-numerical-precision)
-- Structure-of-arrays layout with x as the fastest index:
+- Structure-of-arrays layout with $x$ as the fastest index:
   [section 4](docs/DESIGN.md#4-memory-layout-soa)
 - Fused pull scheme with two buffers:
   [section 5](docs/DESIGN.md#5-propagation-fused-pull-two-buffers)
@@ -45,25 +45,27 @@ Not done yet: see the [Roadmap](#roadmap).
 
 ## Validation: Poiseuille flow
 
-The body-force-driven channel (periodic in x, halfway bounce-back walls) is
+The body-force-driven channel (periodic in $x$, halfway bounce-back walls) is
 the validation case for the boundary and force implementation. With TRT and
 halfway bounce-back the steady solution is the analytical parabola shifted by
 a uniform slip
 
-    du = F_x/(2 nu) * (16 Lambda - 3) / 12
+$$
+\Delta u = \frac{F_x}{2\nu}\,\frac{16\Lambda - 3}{12},
+$$
 
 (Ginzburg, Verhaeghe, d'Humieres 2008, Eq. (2.29) and Table 1), which vanishes
-at Lambda = 3/16.
+at $\Lambda = 3/16$.
 
 Measured with `apps/poiseuille` in double precision on the GPU, for
-Lambda = 3/16 and Lambda = 1/4, H = 8, 16, 32, 64 and nu = 0.01, 1/6, 0.5: the
-numerical profile equals the parabola plus `du` at round-off level (residual at
-most 2.7e-12 u_max, see [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow)
-for details and caveats). Lambda = 1/12 is covered by the tests.
+$\Lambda = 3/16$ and $\Lambda = 1/4$, $H = 8, 16, 32, 64$ and $\nu = 0.01, 1/6, 0.5$: the
+numerical profile equals the parabola plus $\Delta u$ at round-off level (residual at
+most $2.7\times10^{-12}\,u_{\max}$, see [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow)
+for details and caveats). $\Lambda = 1/12$ is covered by the tests.
 
 ![Poiseuille profiles, deviation from the parabola and residual against the slip formula](docs/images/poiseuille.png)
 
-*Case H = 16, nu = 1/6: the numerical profiles (a), their offset from the
+*Case $H = 16$, $\nu = 1/6$: the numerical profiles (a), their offset from the
 parabola against the predicted slip (b), and the residual against the slip
 formula (c).*
 
@@ -78,8 +80,11 @@ into `output/`, see below):
 
 - Test tolerances are derived from floating-point error bounds and operation
   counts, never tuned against the data.
-- Mutation checks: a component is deliberately broken and the test suite must
-  fail.
+- Mutation checks during development: components were deliberately broken and
+  the tests were checked for failure. For example, the symmetric part of the
+  Guo source term is not exercised by the Poiseuille flow (removing it leaves
+  the steady profile unchanged at round-off level), so it is covered by the
+  composition test in `tests/test_force.cpp`.
 - CPU and GPU kernels are compared bitwise; the GPU comparison tests are
   compiled with `--fmad=false`.
 - Poiseuille validation runs on the CPU and on the GPU (the latter with
@@ -138,7 +143,7 @@ CMake options:
 ## Roadmap
 
 - Moving walls and the lid-driven cavity (Ghia et al.)
-- Velocity and pressure boundaries and flow past a cylinder at Re = 100
+- Velocity and pressure boundaries and flow past a cylinder at $\mathrm{Re} = 100$
 - D3Q19
 - Performance measurement and optimization
 - FP16 storage
