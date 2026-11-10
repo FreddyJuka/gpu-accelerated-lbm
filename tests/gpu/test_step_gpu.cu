@@ -21,6 +21,7 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "support/fp_environment.hpp"
 
 using L = lbm::D2Q9;
 using Grid = lbm::Grid2D<L>;
@@ -239,6 +240,10 @@ TYPED_TEST(StepGpu, DeviceBufferRoundTripAndMove) {
     EXPECT_EQ(moved.size(), 0);
     EXPECT_EQ(assigned.size(), n);
     EXPECT_EQ(assigned.data(), old_ptr);
+
+    // Null host pointers are rejected before any CUDA call.
+    EXPECT_THROW(assigned.copy_from_host(nullptr, n), std::invalid_argument);
+    EXPECT_THROW(assigned.copy_to_host(nullptr, n), std::invalid_argument);
 
     // Invalid counts.
     EXPECT_THROW(lbm::DeviceBuffer<T>(0), std::invalid_argument);

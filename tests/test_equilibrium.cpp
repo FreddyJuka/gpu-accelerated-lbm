@@ -6,6 +6,7 @@
 
 #include "lbm/equilibrium.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "support/fp_environment.hpp"
 
 using L = lbm::D2Q9;
 

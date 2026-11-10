@@ -81,6 +81,27 @@ TEST(Grid2D, OverflowLimitAtBoundary) {
         << msg;
 }
 
+// nx*ny = 1.44e18 fits in int64_t but Q*nx*ny = 1.296e19 does not (it exceeds
+// INT64_MAX = 9.22e18), which a naive 64-bit product would overflow.
+TEST(Grid2D, RejectsProductOverflowingInt64) {
+    constexpr std::int64_t big = 1200000000;
+    static_assert(big < kIntMax, "nx and ny must be valid int values");
+    static_assert(big * big > std::numeric_limits<std::int64_t>::max() / L::Q,
+                  "Q*nx*ny must exceed INT64_MAX for this test to be meaningful");
+
+    const std::string msg = rejection_message(static_cast<int>(big), static_cast<int>(big));
+    ASSERT_FALSE(msg.empty());
+    EXPECT_NE(msg.find("Q*nx*ny"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("nx = 1200000000"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("ny = 1200000000"), std::string::npos) << msg;
+    EXPECT_THROW(Grid(static_cast<int>(big), static_cast<int>(big)), std::invalid_argument);
+
+    // Largest representable extents.
+    constexpr int imax = std::numeric_limits<int>::max();
+    EXPECT_THROW(Grid(imax, imax), std::invalid_argument);
+    EXPECT_THROW(Grid(imax, 2), std::invalid_argument);
+}
+
 TEST(Grid2D, LargestGridLastIndex) {
     const Grid g(kMaxNodes, 1);
     const std::int64_t N = g.num_nodes();

@@ -19,9 +19,9 @@ enum class NodeType : std::uint8_t { Fluid = 0, Wall = 1 };
 //   node(x, y)   = y * nx + x
 //   idx(q, x, y) = q * N + y * nx + x,   N = nx * ny.
 //
-// Indices are 32-bit int. The constructor verifies in 64-bit arithmetic that
-// Q * nx * ny <= INT32_MAX, so no index returned by idx() can overflow for
-// 0 <= q < Q, 0 <= x < nx, 0 <= y < ny. The class is trivially copyable and
+// Indices are 32-bit int. The constructor verifies, without forming any
+// product that can overflow, that Q * nx * ny <= INT32_MAX, so no index
+// returned by idx() can overflow for 0 <= q < Q, 0 <= x < nx, 0 <= y < ny. The class is trivially copyable and
 // is passed by value to kernels.
 template <typename L>
 class Grid2D {
@@ -33,10 +33,25 @@ public:
     Grid2D(int nx, int ny) : nx_(nx), ny_(ny) {
         if (nx <= 0) throw std::invalid_argument("Grid2D: nx must be > 0, got " + std::to_string(nx));
         if (ny <= 0) throw std::invalid_argument("Grid2D: ny must be > 0, got " + std::to_string(ny));
-        const std::int64_t total = static_cast<std::int64_t>(L::Q) * nx * ny;
-        if (total > std::numeric_limits<std::int32_t>::max())
-            throw std::invalid_argument("Grid2D: Q*nx*ny must be <= INT32_MAX, got " +
-                                        std::to_string(total));
+        // Q*nx*ny > INT32_MAX is tested as nx > (INT32_MAX / Q) / ny, in integer
+        // arithmetic, so no product is formed and nothing can overflow. For
+        // positive integers it is exactly equivalent: Q*k <= M  <=>  k <= floor(M/Q),
+        // and nx*ny <= K  <=>  nx <= floor(K/ny). Applying both with M = INT32_MAX,
+        // K = floor(M/Q) gives Q*nx*ny <= M  <=>  nx <= floor(floor(M/Q)/ny).
+        constexpr std::int64_t int_max = std::numeric_limits<std::int32_t>::max();
+        constexpr std::int64_t max_nodes = int_max / L::Q;
+        if (static_cast<std::int64_t>(nx) > max_nodes / ny) {
+            // The message reports the product if it fits in int64_t. nx*ny < 2^62
+            // always fits; Q times it may not, which is checked by division.
+            const std::int64_t nodes = static_cast<std::int64_t>(nx) * ny;
+            std::string got = "more than INT64_MAX";
+            if (nodes <= std::numeric_limits<std::int64_t>::max() / L::Q)
+                got = std::to_string(static_cast<std::int64_t>(L::Q) * nodes);
+            throw std::invalid_argument("Grid2D: Q*nx*ny must be <= INT32_MAX, got " + got +
+                                        " (Q = " + std::to_string(L::Q) +
+                                        ", nx = " + std::to_string(nx) +
+                                        ", ny = " + std::to_string(ny) + ")");
+        }
     }
 
     LBM_HD constexpr int nx() const { return nx_; }

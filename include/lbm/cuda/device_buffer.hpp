@@ -25,8 +25,9 @@ public:
         if (count <= 0)
             throw std::invalid_argument("DeviceBuffer: count must be > 0, got " +
                                         std::to_string(count));
-        LBM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_),
-                                  static_cast<std::size_t>(count) * sizeof(T)));
+        void* raw = nullptr;
+        LBM_CUDA_CHECK(cudaMalloc(&raw, static_cast<std::size_t>(count) * sizeof(T)));
+        ptr_ = static_cast<T*>(raw);
         size_ = count;
     }
 
@@ -51,14 +52,18 @@ public:
     const T* data() const { return ptr_; }
     int size() const { return size_; }
 
-    // count must equal size(); otherwise std::invalid_argument.
+    // src must not be null and count must equal size(); otherwise
+    // std::invalid_argument.
     void copy_from_host(const T* src, int count) {
+        if (src == nullptr) throw std::invalid_argument("DeviceBuffer: host pointer is null");
         require_size(count);
         LBM_CUDA_CHECK(cudaMemcpy(ptr_, src, bytes(), cudaMemcpyHostToDevice));
     }
 
-    // count must equal size(); otherwise std::invalid_argument.
+    // dst must not be null and count must equal size(); otherwise
+    // std::invalid_argument.
     void copy_to_host(T* dst, int count) const {
+        if (dst == nullptr) throw std::invalid_argument("DeviceBuffer: host pointer is null");
         require_size(count);
         LBM_CUDA_CHECK(cudaMemcpy(dst, ptr_, bytes(), cudaMemcpyDeviceToHost));
     }

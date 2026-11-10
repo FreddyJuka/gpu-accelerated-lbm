@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -18,17 +19,19 @@ template <typename T, int D>
 class UniformForce {
 public:
     // Host-only validating factory. Throws std::invalid_argument naming the
-    // component and its value if a component is not finite, either as given
-    // or once stored as T (e.g. a double beyond the float range).
+    // component and its value if a component is not finite or its magnitude
+    // exceeds the largest finite T (e.g. a double beyond the float range).
     static UniformForce create(const double (&components)[D]) {
         UniformForce force;
         for (int d = 0; d < D; ++d) {
-            const T stored = static_cast<T>(components[d]);
-            if (!std::isfinite(components[d]) || !std::isfinite(stored))
+            // The range check precedes the cast: converting a double outside the
+            // range of T is undefined behaviour. NaN fails isfinite first.
+            if (!std::isfinite(components[d]) ||
+                std::fabs(components[d]) > static_cast<double>(std::numeric_limits<T>::max()))
                 throw std::invalid_argument("UniformForce: component F[" + std::to_string(d) +
                                             "] = " + std::to_string(components[d]) +
                                             " must be finite");
-            force.F_[d] = stored;
+            force.F_[d] = static_cast<T>(components[d]);
         }
         return force;
     }

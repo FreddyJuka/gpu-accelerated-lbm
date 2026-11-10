@@ -24,6 +24,7 @@
 #include "lbm/force.hpp"
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
+#include "support/fp_environment.hpp"
 
 using L = lbm::D2Q9;
 using ld = long double;
@@ -425,4 +426,23 @@ TEST(ForceFactory, RejectsValueNotFiniteInStorageType) {
     const double big[2] = {0.0, 1e300};
     EXPECT_THROW((void)Force<float>::create(big), std::invalid_argument);
     EXPECT_NO_THROW((void)Force<double>::create(big));
+}
+
+// The range check happens before the cast (the cast of an out-of-range double
+// to float is undefined behaviour) and names the offending component.
+TEST(ForceFactory, RangeCheckAtLargestFiniteValue) {
+    const double fmax = static_cast<double>(std::numeric_limits<float>::max());
+    const double at_max[2] = {fmax, -fmax};
+    const Force<float> force = Force<float>::create(at_max);
+    EXPECT_EQ(force.F(0), std::numeric_limits<float>::max());
+    EXPECT_EQ(force.F(1), -std::numeric_limits<float>::max());
+
+    const double above[2] = {0.0, -std::nextafter(fmax, 1e300)};
+    ASSERT_GT(std::fabs(above[1]), fmax);
+    try {
+        (void)Force<float>::create(above);
+        FAIL() << "expected std::invalid_argument";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("F[1]"), std::string::npos) << e.what();
+    }
 }

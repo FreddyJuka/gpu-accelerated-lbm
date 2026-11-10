@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  cuda:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -28,6 +28,7 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DLBM_WARNINGS_AS_ERRORS=ON
+          -DLBM_ENABLE_CUDA=ON
           -DCMAKE_CUDA_ARCHITECTURES=86
 
       - name: Build
@@ -37,3 +38,56 @@ jobs:
       # GitHub-hosted runners have no GPU. They are run locally.
       - name: Test (CPU only)
         run: ctest --test-dir build -LE gpu --output-on-failure
+
+  # No CUDA: the CPU tests built with FMA instructions enabled. The exact tests
+  # must still pass because the test targets disable FP contraction.
+  cpu-fma:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ make
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DLBM_ENABLE_CUDA=OFF
+          -DLBM_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS=-march=x86-64-v3
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # No CUDA: the CPU tests under AddressSanitizer and UndefinedBehaviorSanitizer.
+  cpu-sanitizers:
+    runs-on: ubuntu-24.04
+    env:
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ make
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DLBM_ENABLE_CUDA=OFF
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
