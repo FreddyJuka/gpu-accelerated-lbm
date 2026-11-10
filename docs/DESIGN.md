@@ -192,6 +192,65 @@ The force is a template policy of the collision: `TRT<T, Force>`, with
 code) and `UniformForce<T, D>` for a uniform constant force. Only the uniform
 force is implemented.
 
+## 12. Validation: Poiseuille flow
+
+The body-force-driven channel (periodic in x, walls at the rows y = 0 and
+y = ny - 1, halfway bounce-back, so the walls sit at y = 1/2 and
+y = ny - 3/2 and the width is H) is the validation case of the boundary and
+force implementation. With TRT and halfway bounce-back the steady solution is
+the analytical parabola `u_a(y) = F_x/(2 nu) (y - 1/2)(ny - 3/2 - y)` shifted
+by a uniform slip
+
+    du = F_x/(2 nu) * (16 Lambda - 3) / 12,
+
+which vanishes at Lambda = 3/16 (equivalently H_eff^2 = H^2 - 1 + (16/3)
+Lambda). Source: Ginzburg, Verhaeghe, d'Humieres, Commun. Comput. Phys. 3(2)
+(2008), Eq. (2.29) with Table 1 (bounce-back, delta_q = 1/2), listed in the
+References.
+
+Measurements with `apps/poiseuille` (double precision, GPU, u_max = 0.01,
+steady state to a change of 1e-14 u_max per 1000 steps): for Lambda = 3/16 and
+Lambda = 1/4, H = 8, 16, 32, 64 and nu = 0.01, 1/6, 0.5, the numerical profile
+equals `u_a + du` at round-off level (residual at most 2.7e-12 u_max, the
+largest values at the largest H and smallest nu, i.e. the longest runs; at
+Lambda = 3/16 the error against the plain parabola is at the same level). The
+fitted uniform offset agrees with the predicted `du` to better than 1e-8
+relative, and the spread of the offset across the channel is at round-off
+level. The formula is thus confirmed for these two values; Lambda = 1/12 is
+covered by the tests only.
+
+The velocity is measured on the collision input: the stored populations are
+post-collision, and the collision adds F to the momentum, so
+`moments_shifted_forced` on the stored populations would be off by about F.
+The measurement runs the gather of the production node function (identity
+collision) and applies `moments_shifted_forced` to the result.
+
+The tests (`tests/test_poiseuille.cpp` on the CPU, `tests/gpu/test_poiseuille_gpu.cu`
+on the GPU, shared code in `tests/poiseuille_common.hpp`) cover H = 8, 16,
+nu = 1/6, 0.5 and Lambda = 3/16, 1/4, 1/12 and check u_x against `u_a + du`,
+and u_y and drho against zero. The reference uses the nu and Lambda effectively
+stored in the collision object, which are asserted to agree with the nominal
+values within their derived rounding bounds. The tolerance is
+`delta_step/(1 - r) + residual_stop + ref_round`: `delta_step` is the round-off
+one step introduces, from operation counts (the mass and momentum bounds of the
+force tests, evaluated on the gathered populations of every node at every
+check); `r` is the decay factor per step of the slowest diffusive mode,
+`exp(-nu pi^2/(H + 1)^2)`; `residual_stop` is `change r^K/(1 - r^K)` for the
+measured final change over the last K = 1000 steps; `ref_round` is the
+rounding of the long double reference. The assumption of this argument is
+stated explicitly: `r` is a physical estimate of the slowest hydrodynamic
+mode, not a proven contraction bound for the full (non-normal) LBM operator;
+the tolerance also assumes that round-off enters through the conserved
+moments with the bounds above, that the same `r` applies to u_y and drho, and
+that the exact-arithmetic steady state is `u_a + du`, u_y = 0, drho = 0. The
+GPU test target keeps nvcc's default FMA contraction.
+
+These tests do not exercise the symmetric part of the Guo source. In this
+flow u_y = 0 and F_y = 0, so its c_x c_y moment, u_x F_y + u_y F_x, vanishes,
+and removing the term leaves the steady profile unchanged at round-off level
+(checked by mutation). The symmetric term is covered by the composition test
+in `tests/test_force.cpp`.
+
 ## References
 
 - I. Ginzburg, F. Verhaeghe, D. d'Humieres, "Two-relaxation-time lattice

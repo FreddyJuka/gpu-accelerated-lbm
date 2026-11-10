@@ -7,7 +7,8 @@ add_executable(lbm_tests
   test_grid.cpp
   test_step_cpu.cpp
   test_bounce_back.cpp
-  test_force.cpp)
+  test_force.cpp
+  test_poiseuille.cpp)
 
 target_link_libraries(lbm_tests PRIVATE
   lbm::lbm
@@ -33,3 +34,12 @@ target_link_libraries(lbm_gpu_tests PRIVATE
 # default FMA contraction.
 target_compile_options(lbm_gpu_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 gtest_discover_tests(lbm_gpu_tests PROPERTIES LABELS gpu)
+
+# GPU Poiseuille validation. Unlike lbm_gpu_tests it keeps nvcc's default FMA
+# contraction (production flags); the tolerance holds either way.
+add_executable(lbm_poiseuille_gpu_tests gpu/test_poiseuille_gpu.cu)
+target_link_libraries(lbm_poiseuille_gpu_tests PRIVATE
+  lbm::lbm
+  lbm_warnings
+  GTest::gtest_main)
+gtest_discover_tests(lbm_poiseuille_gpu_tests PROPERTIES LABELS gpu)
