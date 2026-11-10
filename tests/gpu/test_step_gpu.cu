@@ -92,15 +92,15 @@ TYPED_TEST_SUITE(StepGpu, PrecisionTypes);
 
 } // namespace
 
-// a. One step: GPU equals CPU bitwise, with walls (G1, G2). Both dst buffers
-// start as a copy of the source so that the untouched wall-node values compare
-// equal.
-TYPED_TEST(StepGpu, OneStepMatchesCpu) {
-    using T = TypeParam;
+// Bodies shared by the unforced and the forced collision. Trt is
+// TRT<T> or TRT<T, UniformForce<T, 2>>.
+namespace {
+
+template <typename T, typename Trt>
+void check_one_step(const Trt& trt, const std::string& tag) {
     for (const GridSize s : kSizes)
         for (const Geometry geo : kGeometries) {
             const Grid g(s.nx, s.ny);
-            const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
             const std::vector<T> init = nonuniform_field<T>(g);
             const std::vector<lbm::NodeType> flags = make_flags(g, geo);
             const int n = static_cast<int>(init.size());
@@ -118,18 +118,15 @@ TYPED_TEST(StepGpu, OneStepMatchesCpu) {
             std::vector<T> gpu(init.size());
             d_dst.copy_to_host(gpu.data(), n);
 
-            expect_equal(gpu, cpu, label(s, geo));
+            expect_equal(gpu, cpu, tag + label(s, geo));
         }
 }
 
-// b. 100 steps with alternating buffers on both sides; compared after step 1,
-// 50 and 100. Both buffer pairs start as copies of the initial field.
-TYPED_TEST(StepGpu, HundredStepsMatchCpu) {
-    using T = TypeParam;
+template <typename T, typename Trt>
+void check_hundred_steps(const Trt& trt, const std::string& tag) {
     for (const GridSize s : kSizes)
         for (const Geometry geo : kGeometries) {
             const Grid g(s.nx, s.ny);
-            const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
             const std::vector<T> init = nonuniform_field<T>(g);
             const std::vector<lbm::NodeType> flags = make_flags(g, geo);
             const int n = static_cast<int>(init.size());
@@ -151,10 +148,46 @@ TYPED_TEST(StepGpu, HundredStepsMatchCpu) {
                 if (step == 1 || step == 50 || step == 100) {
                     LBM_CUDA_CHECK(cudaDeviceSynchronize());
                     da.copy_to_host(gpu.data(), n);
-                    expect_equal(gpu, ca, label(s, geo) + " step " + std::to_string(step));
+                    expect_equal(gpu, ca, tag + label(s, geo) + " step " + std::to_string(step));
                 }
             }
         }
+}
+
+// Both components nonzero, so the symmetric and the antisymmetric source are
+// both active.
+template <typename T>
+lbm::TRT<T, lbm::UniformForce<T, 2>> forced_trt() {
+    const double F[2] = {3e-5, -7e-5};
+    return lbm::TRT<T, lbm::UniformForce<T, 2>>::template from_viscosity<L>(
+        0.01, 3.0 / 16.0, lbm::UniformForce<T, 2>::create(F));
+}
+
+} // namespace
+
+// a. One step: GPU equals CPU bitwise, with walls (G1, G2). Both dst buffers
+// start as a copy of the source so that the untouched wall-node values compare
+// equal.
+TYPED_TEST(StepGpu, OneStepMatchesCpu) {
+    check_one_step<TypeParam>(lbm::TRT<TypeParam>::template from_viscosity<L>(0.01, 3.0 / 16.0),
+                              "unforced ");
+}
+
+// a2. The same with the forced collision (Guo source).
+TYPED_TEST(StepGpu, OneStepForcedMatchesCpu) {
+    check_one_step<TypeParam>(forced_trt<TypeParam>(), "forced ");
+}
+
+// b. 100 steps with alternating buffers on both sides; compared after step 1,
+// 50 and 100. Both buffer pairs start as copies of the initial field.
+TYPED_TEST(StepGpu, HundredStepsMatchCpu) {
+    check_hundred_steps<TypeParam>(lbm::TRT<TypeParam>::template from_viscosity<L>(0.01, 3.0 / 16.0),
+                                   "unforced ");
+}
+
+// b2. The same with the forced collision.
+TYPED_TEST(StepGpu, HundredStepsForcedMatchesCpu) {
+    check_hundred_steps<TypeParam>(forced_trt<TypeParam>(), "forced ");
 }
 
 // c. Launcher rejection.

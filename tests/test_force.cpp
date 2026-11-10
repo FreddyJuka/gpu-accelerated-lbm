@@ -400,6 +400,119 @@ TYPED_TEST(ForceTest, CompositionFromParts) {
     }
 }
 
+// g. Second moment of the collision with a body force, independent of the
+// code's expression (long double). With g_ab(q) = c_qa c_qb (even under
+// q -> opp(q)) and fneq_q = f_q - feq_q:
+//
+//   sum_q g (out_q - f_q)
+//     = -wp sum g fneq_plus - wm sum g fneq_minus
+//       + (1 - wp/2) sum g s_sym + (1 - wm/2) sum g s_anti.
+//
+// The odd parts do not contribute: fneq_minus_q = (fneq_q - fneq_opp(q))/2 and
+// s_anti_q are odd under q -> opp(q) while g is even, so the pairs q, opp(q)
+// cancel in sum g fneq_minus and sum g s_anti (for q = opp(q) = 0, c = 0 and
+// g = 0). Since g is even, sum g fneq_plus = sum g fneq. The even source has
+// the lattice moment sum g s_sym = u_a F_b + u_b F_a (test c). Hence
+//
+//   sum_q c_a c_b (out_q - f_q)
+//     = -wp Pi_ab + (1 - wp/2) (u_a F_b + u_b F_a),   Pi_ab = sum c_a c_b fneq_q,
+//
+// with feq at the Guo velocity u = (j + F/2)/rho. Only wp enters, so with
+// wp != wm (asserted) a wrong prefactor of s_sym, e.g. (1 - wm/2), or a
+// missing s_sym changes the left side by far more than the bound.
+//
+// The reference uses the density and velocity that collide() computes
+// (moments_shifted_forced, verified in test_moments.cpp and test d) and the
+// same feq values and the same coefficient fl(1 - wp/2): the identity holds
+// for any (drho, u, feq) in exact arithmetic, so their rounding errors do not
+// enter, and no property of feq is used.
+//
+// Bound (first order in u = eps_ld/2; g_q in {0, 1} exact; sums over q):
+//   chain of out_q:   K_chain u sum g (M_q + N_q + N_opp)       (as in test d)
+//   source rounding:  (K_src + K_w) u sum g W_q                  (as in test d)
+//   test arithmetic:  (K_acc + 1) u sum g (|out_q| + |f_q|)
+//                     [one subtraction per term and the accumulation]
+//   reference Pi:     (K_acc + 2) u wp sum g |fneq_q|
+//                     [accumulation, product wp * Pi, final sum]
+//   reference u F:    (K_ref + 2) u c1 (|u_a F_b| + |u_b F_a|)
+//                     [3 roundings in u_a F_b + u_b F_a, product by c1, final
+//                      sum], c1 = fl(1 - wp/2).
+constexpr ld K_tst = K_acc + 1.0L;
+constexpr ld K_refPi = K_acc + 2.0L;
+constexpr ld K_refF = K_ref + 2.0L;
+static_assert(K_tst <= 16.0L && K_refPi <= 16.0L && K_refF <= 16.0L,
+              "every factor must not exceed 16");
+
+TEST(ForceCollide, SecondMomentIncludesSymmetricSource) {
+    using Fld = Force<ld>;
+    int checked_nonzero = 0;
+    for (const auto& fc : kF) {
+        const double fcd[2] = {fc[0], fc[1]};
+        ASSERT_NE(fc[0], 0.0);
+        ASSERT_NE(fc[1], 0.0);
+        const auto trt = lbm::TRT<ld, Fld>::from_viscosity<L>(P1.nu, P1.lambda, Fld::create(fcd));
+        const ld wp = trt.omega_plus(), wm = trt.omega_minus();
+        ASSERT_NE(wp, wm);
+        const ld c1 = 1.0L - 0.5L * wp;
+        const ld F[2] = {static_cast<ld>(fc[0]), static_cast<ld>(fc[1])};
+
+        for (const State& st : low_mach_states()) {
+            ld f[L::Q];
+            perturbed_input<ld>(st, f);
+            ld drho, u[L::D];
+            lbm::moments_shifted_forced<L, ld>(f, F, drho, u);
+
+            ld fneq[L::Q], N[L::Q];
+            for (int q = 0; q < L::Q; ++q) {
+                const ld feq = lbm::equilibrium_shifted<L, ld>(q, drho, u);
+                fneq[q] = f[q] - feq;
+                N[q] = std::abs(f[q]) + std::abs(feq);
+            }
+
+            ld out[L::Q];
+            for (int q = 0; q < L::Q; ++q) out[q] = f[q];
+            trt.collide<L>(out);
+
+            for (int a = 0; a < L::D; ++a)
+                for (int b = 0; b < L::D; ++b) {
+                    ld lhs = 0, pi = 0, sum_fneq = 0, sum_chain = 0, sum_W = 0, sum_io = 0;
+                    for (int q = 0; q < L::Q; ++q) {
+                        const ld g = static_cast<ld>(L::c(q, a)) * L::c(q, b);
+                        const ld Wq = source_scale(q, u, F);
+                        const ld Np = N[q] + N[L::opp(q)];
+                        const ld Mq = std::abs(f[q]) + 0.5L * (wp + wm) * Np + Wq;
+                        lhs += g * (out[q] - f[q]);
+                        pi += g * fneq[q];
+                        sum_fneq += std::abs(g) * std::abs(fneq[q]);
+                        sum_chain += std::abs(g) * (Mq + Np);
+                        sum_W += std::abs(g) * Wq;
+                        sum_io += std::abs(g) * (std::abs(out[q]) + std::abs(f[q]));
+                    }
+                    const ld uF = u[a] * F[b] + u[b] * F[a];
+                    const ld uF_mag = std::abs(u[a] * F[b]) + std::abs(u[b] * F[a]);
+                    const ld rhs = -wp * pi + c1 * uF;
+
+                    const ld tol = U_LD * (K_chain * sum_chain + (K_src + K_w) * sum_W +
+                                           K_tst * sum_io + K_refPi * wp * sum_fneq +
+                                           K_refF * c1 * uF_mag);
+                    EXPECT_LE(std::abs(lhs - rhs), tol)
+                        << "a = " << a << ", b = " << b << ", F = (" << fc[0] << ", " << fc[1]
+                        << "), u = (" << st.ux << ", " << st.uy << ")";
+
+                    // Precondition: the source term changes the left side by more than
+                    // the bound, and the prefactor (1 - wm/2) would change it by more
+                    // than the bound too, so the test can fail for both mutations.
+                    if (uF != 0.0L) {
+                        ++checked_nonzero;
+                        ASSERT_GT(0.5L * std::abs(wp - wm) * std::abs(uF), tol);
+                        ASSERT_GT(c1 * std::abs(uF), tol);
+                    }
+                }
+        }
+    }
+    ASSERT_GT(checked_nonzero, 0);
+}
+
 // f. Factory rejection names the component.
 TYPED_TEST(ForceTest, FactoryRejectsNonFinite) {
     using T = TypeParam;
