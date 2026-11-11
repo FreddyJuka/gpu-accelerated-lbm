@@ -5,8 +5,10 @@
 //
 // ChannelSetup (as in apps/poiseuille/main.cu): nx = 4, ny = H + 2, wall rows y = 0
 // and y = ny - 1 (halfway bounce-back puts the walls at y = 0.5 and
-// y = ny - 1.5, channel width H), TRT<double, UniformForce<double, 2>>,
-// F_x = 8 nu u_max / H^2, u_max = 0.01, rest initial state.
+// y = ny - 1.5, channel width H), TRT<T, UniformForce<T, 2>>,
+// F_x = 8 nu u_max / H^2, u_max = 0.01, rest initial state. T is the precision
+// of the run (storage and compute type), double or float; the reference, the
+// decay factor and the bounds are evaluated in long double for both.
 //
 // ---------------------------------------------------------------------------
 // Reference solution
@@ -47,8 +49,8 @@
 //    introduces into the measured field, from operation counts. The momentum
 //    added by the collision deviates from F by at most tol_j, and the mass
 //    by at most tol_mass; these are the bounds derived in test_force.cpp
-//    (ForceCollide.ConservesMassAndMomentumChangeIsF) for any input, here in
-//    double (u = eps/2):
+//    (ForceCollide.ConservesMassAndMomentumChangeIsF) for any input, here
+//    with the eps of T (u = eps/2):
 //      tol_mass = w+ (K_sum eps S + (K_e eps + K_w u) sum_q scale_q)
 //                 + K_chain u sum_q chain_q + (K_src + K_w) u sum_q W_q
 //      tol_j,d  = w- (K_sum eps S + (K_e eps + K_w u) sum_q |c_qd| scale_q
@@ -93,6 +95,40 @@
 //    of magnitudes of its terms, max u_a + F/(2 nu)(16 Lambda + 3)/12.
 //
 // No factor was chosen by trying values against data.
+//
+// ---------------------------------------------------------------------------
+// Single precision
+// ---------------------------------------------------------------------------
+// The float run uses the same setup, measurement, reference and tolerance
+// construction, under the same assumptions, with the eps of float in
+// delta_step. Three points differ from double:
+//
+//  - Parameters. lbm::TRT and lbm::UniformForce compute in double and round
+//    the result to T. The reference uses the stored values, and
+//    effective_parameters allows one more rounding u_T per stored rate.
+//
+//  - Stopping rule. The threshold is the same number of eps (kStopChange). It
+//    only decides when to stop: whatever its value, the distance to the fixed
+//    point it leaves is bounded by residual_stop from the measured change. A
+//    float run usually ends with a change of exactly zero, a fixed point of
+//    the rounded scheme; its distance to the exact steady state is round-off,
+//    which is what delta_step / (1 - r) bounds.
+//
+//  - Cases. delta_step / (1 - r) grows as eps (H + 1)^2 / nu while the slip
+//    decreases as 1 / H^2, so tol / |du| grows as eps H^2 (H + 1)^2 / nu. In
+//    double it is below 1e-8 in every case. In float the derived tolerance is
+//    2 % to 10 % of the slip at H = 8, 30 % to 50 % at H = 16 with nu = 0.5,
+//    and about the slip itself (0.9 and 1.3 times) at H = 16 with nu = 1/6.
+//    A case whose tolerance is not below the slip cannot validate the slip
+//    formula, so the float tests are restricted to float_cases(): H = 8 with
+//    both viscosities and H = 16 with nu = 0.5. The restriction follows from
+//    the derived tolerance alone, not from the measured errors, and the same
+//    assertion as in double (|du| > tol_x) fails the test if a float case
+//    stops resolving the slip. Comparing float against the double result
+//    instead would not be sharper: the only bound derivable for that
+//    difference under these assumptions is tol_float + tol_double. Wider
+//    channels and smaller viscosities are therefore not validated in float by
+//    this construction.
 
 #include <gtest/gtest.h>
 
@@ -102,6 +138,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "lbm/collision/trt.hpp"
@@ -116,8 +153,10 @@ namespace poiseuille {
 
 using L = lbm::D2Q9;
 using Grid = lbm::Grid2D<L>;
-using Force = lbm::UniformForce<double, L::D>;
-using Collision = lbm::TRT<double, Force>;
+template <typename T>
+using Force = lbm::UniformForce<T, L::D>;
+template <typename T>
+using Collision = lbm::TRT<T, Force<T>>;
 using ld = long double;
 
 static_assert(std::numeric_limits<ld>::digits >= 64,
@@ -127,7 +166,14 @@ constexpr double kUmax = 0.01;
 constexpr int kNx = 4;
 constexpr int kCheckEvery = 1000;
 constexpr long kStepCap = 1000000;
-constexpr double kStopChange = 1e-14 * kUmax;
+// Stopping threshold on the change of u_x over one check window: 1e-14 u_max in
+// double (about 45 eps u_max) and the same number of eps in T (the ratio of
+// the epsilons is a power of two, so the double value is unchanged).
+template <typename T>
+constexpr double kStopChange =
+    1e-14 * kUmax *
+    (static_cast<double>(std::numeric_limits<T>::epsilon()) / std::numeric_limits<double>::epsilon());
+static_assert(kStopChange<double> == 1e-14 * kUmax, "the double stopping rule must not change");
 
 // Operation-count factors (see the comment above and test_force.cpp).
 constexpr ld K_chain = 14.0L;  // roundings in the update of one out_q
@@ -141,8 +187,13 @@ static_assert(K_chain <= 16.0L && K_src <= 16.0L && K_w <= 16.0L && K_sum <= 16.
                   K_e <= 16.0L && K_div <= 16.0L && K_ref <= 16.0L,
               "every factor must not exceed 16");
 
-constexpr ld kEps = std::numeric_limits<double>::epsilon();
-constexpr ld kU = 0.5L * kEps;
+template <typename T>
+constexpr ld kEps = std::numeric_limits<T>::epsilon();  // of the storage/compute type T
+template <typename T>
+constexpr ld kU = 0.5L * kEps<T>;
+// Rounding of the conversion double -> T of a stored parameter (exact for double).
+template <typename T>
+constexpr ld kUcast = std::is_same_v<T, double> ? 0.0L : kU<T>;
 constexpr ld kUld = 0.5L * std::numeric_limits<ld>::epsilon();
 constexpr ld kPi = 3.14159265358979323846264338327950288L;
 
@@ -176,19 +227,20 @@ inline std::string case_name(const Case& c) {
     return "H" + std::to_string(c.H) + "_nu" + tag(c.nu) + "_lambda" + tag(c.lambda);
 }
 
+template <typename T>
 struct ChannelSetup {
     Case c;
     Grid g;
     std::vector<lbm::NodeType> flags;
-    Force force;
-    Collision coll;
+    Force<T> force;
+    Collision<T> coll;
 
     explicit ChannelSetup(const Case& cs)
         : c(cs),
           g(kNx, cs.H + 2),
           flags(make_flags(kNx, cs.H + 2)),
           force(make_force(cs)),
-          coll(Collision::from_viscosity<L>(cs.nu, cs.lambda, force)) {}
+          coll(Collision<T>::template from_viscosity<L>(cs.nu, cs.lambda, force)) {}
 
     static std::vector<lbm::NodeType> make_flags(int nx, int ny) {
         std::vector<lbm::NodeType> f(static_cast<std::size_t>(nx * ny), lbm::NodeType::Fluid);
@@ -198,14 +250,15 @@ struct ChannelSetup {
         }
         return f;
     }
-    static Force make_force(const Case& cs) {
+    static Force<T> make_force(const Case& cs) {
         const double fc[2] = {8.0 * cs.nu * kUmax / (static_cast<double>(cs.H) * cs.H), 0.0};
-        return Force::create(fc);
+        return Force<T>::create(fc);
     }
 };
 
+template <typename T>
 struct Fields {
-    std::vector<double> ux, uy, drho;  // index y * nx + x (walls: 0)
+    std::vector<T> ux, uy, drho;  // index y * nx + x (walls: 0)
 };
 
 struct Bounds {
@@ -213,7 +266,8 @@ struct Bounds {
 };
 
 // Sum of magnitudes of the terms of s_anti + s_sym (test_force.cpp).
-inline ld source_scale(int q, const double (&u)[L::D], const double (&F)[L::D]) {
+template <typename T>
+ld source_scale(int q, const T (&u)[L::D], const T (&F)[L::D]) {
     const ld a = L::inv_cs2<ld>();
     ld cu = 0, cF = 0, uF = 0;
     for (int d = 0; d < L::D; ++d) {
@@ -225,7 +279,8 @@ inline ld source_scale(int q, const double (&u)[L::D], const double (&F)[L::D]) 
 }
 
 // Sum of magnitudes of the terms of the shifted equilibrium (test_equilibrium.cpp).
-inline ld equilibrium_scale(int q, double drho_d, const double (&u_d)[L::D]) {
+template <typename T>
+ld equilibrium_scale(int q, T drho_d, const T (&u_d)[L::D]) {
     const ld drho = drho_d;
     const ld rho = 1.0L + drho;
     const ld a = L::inv_cs2<ld>();
@@ -239,13 +294,16 @@ inline ld equilibrium_scale(int q, double drho_d, const double (&u_d)[L::D]) {
 }
 
 // delta_step of one node, from its gathered (collision input) populations.
-inline void accumulate_bounds(const double (&f)[L::Q], double drho, const double (&u)[L::D],
-                              const double (&F)[L::D], ld wp, ld wm, Bounds& b) {
+template <typename T>
+void accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (&F)[L::D], ld wp,
+                       ld wm, Bounds& b) {
+    const ld eps = kEps<T>;
+    const ld uT = kU<T>;
     ld N[L::Q];
     ld S = 0;
     for (int q = 0; q < L::Q; ++q) {
         N[q] = std::abs(static_cast<ld>(f[q])) +
-               std::abs(static_cast<ld>(lbm::equilibrium_shifted<L, double>(q, drho, u)));
+               std::abs(static_cast<ld>(lbm::equilibrium_shifted<L, T>(q, drho, u)));
         S += std::abs(static_cast<ld>(f[q]));
     }
     ld sum_scale = 0, sum_chain = 0, sum_W = 0;
@@ -266,17 +324,17 @@ inline void accumulate_bounds(const double (&f)[L::Q], double drho, const double
             sW[d] += ac * W;
         }
     }
-    const ld tol_mass = wp * (K_sum * kEps * S + (K_e * kEps + K_w * kU) * sum_scale) +
-                        K_chain * kU * sum_chain + (K_src + K_w) * kU * sum_W;
-    const ld d_rho = tol_mass + K_sum * kEps * S;  // + measurement
+    const ld tol_mass = wp * (K_sum * eps * S + (K_e * eps + K_w * uT) * sum_scale) +
+                        K_chain * uT * sum_chain + (K_src + K_w) * uT * sum_W;
+    const ld d_rho = tol_mass + K_sum * eps * S;  // + measurement
     const ld rho = 1.0L + static_cast<ld>(drho);
     ld du[L::D];
     for (int d = 0; d < L::D; ++d) {
         const ld Fd = std::abs(static_cast<ld>(F[d]));
-        const ld meas_j = K_sum * kEps * S + K_div * kU * (S + 0.5L * Fd);
-        const ld tol_j = wm * (K_sum * kEps * S + (K_e * kEps + K_w * kU) * sc[d] +
-                               K_div * kU * (S + 0.5L * Fd)) +
-                         K_chain * kU * schain[d] + (K_src + K_w) * kU * sW[d];
+        const ld meas_j = K_sum * eps * S + K_div * uT * (S + 0.5L * Fd);
+        const ld tol_j = wm * (K_sum * eps * S + (K_e * eps + K_w * uT) * sc[d] +
+                               K_div * uT * (S + 0.5L * Fd)) +
+                         K_chain * uT * schain[d] + (K_src + K_w) * uT * sW[d];
         du[d] = (tol_j + meas_j + std::abs(static_cast<ld>(u[d])) * d_rho) / rho;
     }
     b.ux = std::max(b.ux, du[0]);
@@ -286,25 +344,26 @@ inline void accumulate_bounds(const double (&f)[L::Q], double drho, const double
 
 // Fields of the stored post-collision populations, measured on the gathered
 // populations (see the file comment); also accumulates the step bounds.
-inline Fields measure(const ChannelSetup& s, const std::vector<double>& stored, Bounds& bounds) {
+template <typename T>
+Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds& bounds) {
     const Grid& g = s.g;
-    std::vector<double> gathered = stored;
+    std::vector<T> gathered = stored;
     for (int y = 0; y < g.ny(); ++y)
         for (int x = 0; x < g.nx(); ++x)
-            lbm::pull_stream_collide<L, double>(g, s.flags.data(), stored.data(), gathered.data(),
-                                                IdentityCollision{}, x, y);
-    Fields r;
+            lbm::pull_stream_collide<L, T>(g, s.flags.data(), stored.data(), gathered.data(),
+                                           IdentityCollision{}, x, y);
+    Fields<T> r;
     const std::size_t n = static_cast<std::size_t>(g.num_nodes());
-    r.ux.assign(n, 0.0);
-    r.uy.assign(n, 0.0);
-    r.drho.assign(n, 0.0);
-    const double F[2] = {s.force.F(0), s.force.F(1)};
+    r.ux.assign(n, T(0));
+    r.uy.assign(n, T(0));
+    r.drho.assign(n, T(0));
+    const T F[2] = {s.force.F(0), s.force.F(1)};
     for (int y = 0; y < g.ny(); ++y)
         for (int x = 0; x < g.nx(); ++x) {
             if (s.flags[static_cast<std::size_t>(g.node(x, y))] == lbm::NodeType::Wall) continue;
-            double f[L::Q], u[2], drho;
+            T f[L::Q], u[2], drho;
             for (int q = 0; q < L::Q; ++q) f[q] = gathered[static_cast<std::size_t>(g.idx(q, x, y))];
-            lbm::moments_shifted_forced<L, double>(f, F, drho, u);
+            lbm::moments_shifted_forced<L, T>(f, F, drho, u);
             const std::size_t i = static_cast<std::size_t>(g.node(x, y));
             r.ux[i] = u[0];
             r.uy[i] = u[1];
@@ -315,9 +374,9 @@ inline Fields measure(const ChannelSetup& s, const std::vector<double>& stored, 
 }
 
 // Effective parameters of the stored rates, and their agreement with the
-// nominal ones within the derived rounding bounds. With u = eps/2 and the
-// conversion of lbm::TRT (tau+ = fl(fl(3 nu) + 1/2), a = fl(tau+ - 1/2),
-// tau- = fl(fl(lambda/a) + 1/2), omega = fl(1/tau)):
+// nominal ones within the derived rounding bounds. With u = eps/2 of double
+// and the conversion of lbm::TRT, computed in double (tau+ = fl(fl(3 nu) + 1/2),
+// a = fl(tau+ - 1/2), tau- = fl(fl(lambda/a) + 1/2), omega = fl(1/tau)):
 //   tau+_eff = 1/omega+ has relative error <= 3u (3 nu: 1, + 1/2: 1, 1/tau: 1),
 //   so (tau+ - 1/2) has relative error <= 3u tau+/(3 nu) = 3u (1 + 1/(6 nu)).
 //   a has relative error <= 3u tau+/(3 nu) (2u tau+ from tau+, u a from the
@@ -326,11 +385,19 @@ inline Fields measure(const ChannelSetup& s, const std::vector<double>& stored, 
 //   roundings, each u tau-).
 // Lambda_eff = (tau+ - 1/2)(tau- - 1/2) has the sum of the relative errors
 // of its two factors (first order; second order is covered by K_ref u_ld).
+// For T = float each omega is then rounded to T, one more relative error
+// u_c = eps_T/2 of tau_eff (u_c = 0 for double, where the cast is exact):
+// 3u becomes 3u + u_c in the tau+ terms and 2u becomes 2u + u_c in the tau-
+// term. The a and q of the conversion never see the stored float rates, so
+// rel_q is unchanged.
 struct Effective {
     ld nu, lambda, tau_plus;
 };
 
-inline Effective effective_parameters(const ChannelSetup& s) {
+template <typename T>
+Effective effective_parameters(const ChannelSetup<T>& s) {
+    const ld uD = kU<double>;   // the conversion is computed in double
+    const ld uC = kUcast<T>;    // and each rate is then stored as T
     const ld tp = 1.0L / static_cast<ld>(s.coll.omega_plus());
     const ld tm = 1.0L / static_cast<ld>(s.coll.omega_minus());
     Effective e;
@@ -342,9 +409,9 @@ inline Effective effective_parameters(const ChannelSetup& s) {
     const ld tp_nom = 3.0L * nu + 0.5L;
     const ld q_nom = lam / (3.0L * nu);
     const ld tm_nom = q_nom + 0.5L;
-    const ld rel_nu = 3.0L * kU * (1.0L + 1.0L / (6.0L * nu));
-    const ld rel_q = kU * (3.0L * tp_nom / (3.0L * nu) + 1.0L);
-    const ld rel_lambda = rel_nu + rel_q + 2.0L * kU * tm_nom / q_nom;
+    const ld rel_nu = (3.0L * uD + uC) * (1.0L + 1.0L / (6.0L * nu));
+    const ld rel_q = uD * (3.0L * tp_nom / (3.0L * nu) + 1.0L);
+    const ld rel_lambda = rel_nu + rel_q + (2.0L * uD + uC) * tm_nom / q_nom;
     EXPECT_LE(std::abs(e.nu / nu - 1.0L), rel_nu + K_ref * kUld) << "effective nu";
     EXPECT_LE(std::abs(e.lambda / lam - 1.0L), rel_lambda + K_ref * kUld) << "effective lambda";
     return e;
@@ -352,9 +419,9 @@ inline Effective effective_parameters(const ChannelSetup& s) {
 
 // Stepper interface used by check_case:
 //   void advance(int n)                          n steps with alternating buffers
-//   const std::vector<double>& state()           stored populations (host copy)
-template <typename Stepper>
-void check_case(const ChannelSetup& s, Stepper& stepper) {
+//   const std::vector<T>& state()                stored populations (host copy)
+template <typename T, typename Stepper>
+void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
     const Case& c = s.c;
     const Grid& g = s.g;
     const int ny = g.ny();
@@ -372,9 +439,9 @@ void check_case(const ChannelSetup& s, Stepper& stepper) {
     const ld du = Fx / (2.0L * eff.nu) * (16.0L * eff.lambda - 3.0L) / 12.0L;
 
     Bounds bounds;
-    Fields prev = measure(s, stepper.state(), bounds);  // rest state
-    Fields cur = prev;
-    double change_x = 0, change_y = 0, change_rho = 0;
+    Fields<T> prev = measure(s, stepper.state(), bounds);  // rest state
+    Fields<T> cur = prev;
+    T change_x = 0, change_y = 0, change_rho = 0;
     long steps = 0;
     bool converged = false;
     while (steps < kStepCap) {
@@ -389,7 +456,7 @@ void check_case(const ChannelSetup& s, Stepper& stepper) {
             change_rho = std::max(change_rho, std::abs(cur.drho[i] - prev.drho[i]));
         }
         prev = cur;
-        if (change_x <= kStopChange) {
+        if (static_cast<double>(change_x) <= kStopChange<T>) {
             converged = true;
             break;
         }
@@ -400,7 +467,7 @@ void check_case(const ChannelSetup& s, Stepper& stepper) {
     for (int y = 1; y < ny - 1; ++y) ua_max = std::max(ua_max, analytic(y));
     const ld ref_round = K_ref * kUld * (ua_max + Fx / (2.0L * eff.nu) * (16.0L * eff.lambda + 3.0L) / 12.0L);
 
-    auto tail = [&](double change) { return static_cast<ld>(change) * rK / (1.0L - rK); };
+    auto tail = [&](T change) { return static_cast<ld>(change) * rK / (1.0L - rK); };
     const ld tol_x = bounds.ux / (1.0L - r) + tail(change_x) + ref_round;
     const ld tol_y = bounds.uy / (1.0L - r) + tail(change_y);
     const ld tol_rho = bounds.rho / (1.0L - r) + tail(change_rho);
@@ -414,7 +481,8 @@ void check_case(const ChannelSetup& s, Stepper& stepper) {
             err_rho = std::max(err_rho, std::abs(static_cast<ld>(cur.drho[i])));
         }
 
-    std::cout << "[ info ] " << case_name(c) << ": steps " << steps << ", du/umax "
+    std::cout << "[ info ] " << case_name(c) << (sizeof(T) == sizeof(float) ? " float" : " double")
+              << ": steps " << steps << ", du/umax "
               << static_cast<double>(du / kUmax) << ", err_x/umax "
               << static_cast<double>(err_x / kUmax) << " (tol "
               << static_cast<double>(tol_x / kUmax) << "), err_y " << static_cast<double>(err_y)
@@ -437,6 +505,15 @@ inline std::vector<Case> all_cases() {
     for (int H : {8, 16})
         for (double nu : {1.0 / 6.0, 0.5})
             for (double lambda : {3.0 / 16.0, 1.0 / 4.0, 1.0 / 12.0}) v.push_back({H, nu, lambda});
+    return v;
+}
+
+// Cases of the float tests: those of all_cases() whose derived float tolerance
+// is below the slip (see "Single precision" in the file comment).
+inline std::vector<Case> float_cases() {
+    std::vector<Case> v;
+    for (const Case& c : all_cases())
+        if (c.H == 8 || c.nu == 0.5) v.push_back(c);
     return v;
 }
 
