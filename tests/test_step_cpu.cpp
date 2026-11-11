@@ -23,28 +23,20 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
-using L = lbm::D2Q9;
-using Grid = lbm::Grid2D<L>;
+using namespace lbmtest;
 
 namespace {
 
 constexpr int NX = 7;
 constexpr int NY = 5;
 
-// Collision policy that leaves the populations unchanged (pure propagation).
-struct IdentityCollision {
-    template <typename Lat, typename T>
-    LBM_HD void collide(T (&)[Lat::Q]) const {}
-};
-
 // All-Fluid flags: the step then reproduces the fully periodic domain.
 std::vector<lbm::NodeType> all_fluid(const Grid& g) {
     return std::vector<lbm::NodeType>(static_cast<std::size_t>(g.num_nodes()), lbm::NodeType::Fluid);
 }
-
-int mod(int a, int n) { return ((a % n) + n) % n; }
 
 // Source index of the pull for population q arriving at (x, y), independent of
 // the Grid2D wrap functions.
@@ -57,37 +49,6 @@ template <typename T>
 class StepCpu : public ::testing::Test {};
 using PrecisionTypes = ::testing::Types<float, double>;
 TYPED_TEST_SUITE(StepCpu, PrecisionTypes);
-
-// Distinct, exactly representable values: q*1000 + node index (< 9000 < 2^24).
-template <typename T>
-std::vector<T> distinct_field(const Grid& g) {
-    std::vector<T> f(static_cast<std::size_t>(L::Q * g.num_nodes()));
-    for (int q = 0; q < L::Q; ++q)
-        for (int y = 0; y < g.ny(); ++y)
-            for (int x = 0; x < g.nx(); ++x)
-                f[static_cast<std::size_t>(g.idx(q, x, y))] = static_cast<T>(q * 1000 + g.node(x, y));
-    return f;
-}
-
-// Non-uniform shifted populations: equilibrium of a smooth drho/u field plus
-// the deterministic perturbation p_q = 1e-3 * w_q * m_q, m_q = ((3q+1) mod 7) - 3
-// (as in test_moments.cpp).
-template <typename T>
-std::vector<T> nonuniform_field(const Grid& g) {
-    std::vector<T> f(static_cast<std::size_t>(L::Q * g.num_nodes()));
-    for (int y = 0; y < g.ny(); ++y)
-        for (int x = 0; x < g.nx(); ++x) {
-            const T drho = T(0.01) * static_cast<T>(x) - T(0.005) * static_cast<T>(y);
-            const T u[2] = {T(0.02) + T(0.004) * static_cast<T>(y),
-                            T(-0.01) + T(0.003) * static_cast<T>(x)};
-            for (int q = 0; q < L::Q; ++q) {
-                const T p = T(1e-3) * L::w<T>(q) * static_cast<T>(((3 * q + 1) % 7) - 3);
-                f[static_cast<std::size_t>(g.idx(q, x, y))] =
-                    lbm::equilibrium_shifted<L, T>(q, drho, u) + p;
-            }
-        }
-    return f;
-}
 
 } // namespace
 
@@ -186,8 +147,7 @@ TYPED_TEST(StepCpu, UniformState) {
     T f0[L::Q];
     const T u[2] = {T(0.03), T(-0.02)};
     for (int q = 0; q < L::Q; ++q)
-        f0[q] = lbm::equilibrium_shifted<L, T>(q, T(0.01), u) +
-                T(1e-3) * L::w<T>(q) * static_cast<T>(((3 * q + 1) % 7) - 3);
+        f0[q] = lbm::equilibrium_shifted<L, T>(q, T(0.01), u) + perturbation<T>(q);
 
     std::vector<T> src(static_cast<std::size_t>(L::Q * g.num_nodes()));
     for (int q = 0; q < L::Q; ++q)

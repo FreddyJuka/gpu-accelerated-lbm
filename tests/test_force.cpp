@@ -2,8 +2,8 @@
 // collision.
 //
 // Accuracy of the T-precision forced collision against a long double
-// reference is deferred to the task that moves the error-bound helpers into a
-// shared test header. Here:
+// reference is deferred to a later task (the helpers it needs are in
+// support/error_bounds.hpp). Here:
 //   a. regression against the unforced collision (exact),
 //   b. parity of the source parts (exact),
 //   c, d. semantics of the scheme (source moments, mass and momentum change)
@@ -24,33 +24,16 @@
 #include "lbm/force.hpp"
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
+#include "support/error_bounds.hpp"
+#include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
-using L = lbm::D2Q9;
-using ld = long double;
+using namespace lbmtest;
 
 namespace {
 
-static_assert(std::numeric_limits<ld>::digits >= 64,
-              "long double must be extended precision for the reference");
-
 template <typename T>
 using Force = lbm::UniformForce<T, L::D>;
-
-struct State {
-    double drho;
-    double ux, uy;
-};
-
-// Same low-Mach state set as test_collision_trt.cpp.
-std::vector<State> low_mach_states() {
-    const double drhos[] = {0.0, 0.01, -0.02};
-    const double us[][2] = {{0.0, 0.0}, {0.05, 0.0}, {0.0, -0.03}, {0.04, 0.07}};
-    std::vector<State> s;
-    for (double r : drhos)
-        for (const auto& u : us) s.push_back({r, u[0], u[1]});
-    return s;
-}
 
 struct Params {
     double nu;
@@ -62,88 +45,16 @@ constexpr Params P2{1.0 / 6.0, 0.25};   // omega+ = omega- = 1
 // Forces with both components nonzero.
 constexpr double kF[][2] = {{1e-5, -2e-5}, {3e-4, 7e-4}};
 
-// Equilibrium populations of the state plus the deterministic non-equilibrium
-// perturbation p_q = 1e-3 w_q m_q, m_q = ((3q + 1) mod 7) - 3 (not symmetric
-// under q -> opp(q)), as in test_collision_trt.cpp.
-template <typename T>
-void perturbed_input(const State& s, T (&f)[L::Q]) {
-    const T drho = static_cast<T>(s.drho);
-    const T u[2] = {static_cast<T>(s.ux), static_cast<T>(s.uy)};
-    for (int q = 0; q < L::Q; ++q) {
-        const int m = ((3 * q + 1) % 7) - 3;
-        f[q] = lbm::equilibrium_shifted<L, T>(q, drho, u) + T(1e-3) * L::template w<T>(q) * T(m);
-    }
-}
-
 template <typename T>
 class ForceTest : public ::testing::Test {};
 using PrecisionTypes = ::testing::Types<float, double>;
 TYPED_TEST_SUITE(ForceTest, PrecisionTypes);
 
 // ---------------------------------------------------------------------------
-// Error-bound constants for the long double tests. u = eps_ld / 2 is the unit
-// roundoff. Each is an upper bound on a derived operation count; none is
-// fitted to data.
+// Error-bound constants: K_src, K_acc, K_w, K_uF, K_chain, K_sum, K_e and K_div
+// and the scales source_scale and scale_e are defined with their derivations in
+// support/error_bounds.hpp. The long double tests use u = eps_ld / 2 = kULd.
 // ---------------------------------------------------------------------------
-// guo_source_parts, D = 2: s_anti = (w a) cF has 3 roundings (cF: 1; w a: 1;
-// product: 1); s_sym has 10: cu 1, cF 1, (a a) cu 1, (.) cF 1, uF 3 (two
-// products, one sum), a uF 1, difference 1, w * (.) 1. (a a is exact: a = 3.)
-// Each rounding changes s_q by at most u times the magnitude of the terms it
-// affects, so |s_q - exact| <= K_src u W_q with
-//   W_q = w (a^2 |cu|' |cF|' + a |uF|'),  |cu|' = sum_d |c_d||u_d|, etc.
-// (sum of magnitudes of the terms; for s_anti W_anti = w a |cF|' <= W_q is not
-// needed: 10 is the larger count).
-constexpr ld K_src = 10.0L;
-// Sequential sum of Q = 9 terms: (Q - 1) u sum of magnitudes.
-constexpr ld K_acc = L::Q - 1;
-// The weights w_q(ld) = T(4)/T(9) etc. carry a relative error of at most u, so
-// a moment identity that uses sum_q w_q ... holds up to u sum of magnitudes.
-constexpr ld K_w = 1.0L;
-// Reference right-hand side u_a F_b + u_b F_a: 2 products and 1 sum = 3
-// roundings.
-constexpr ld K_ref = 3.0L;
-// Collision chain of out_q in TRT (forced): fneq_q, fneq_opp (2), a + b and
-// a - b (2), omega * fneq_pm (2), two subtractions (2), (1 - omega/2) twice
-// (2), two source products (2), two additions (2) = 14 roundings, each of
-// relative size u on a quantity bounded by M_q + N_q + N_opp (defined at use).
-constexpr ld K_chain = 14.0L;
-// Sum of Q terms in moments_shifted_forced (test_moments.cpp): (Q - 1)/2 eps.
-constexpr ld K_sum = L::Q / 2.0L;
-// Shifted equilibrium (test_equilibrium.cpp): 5 eps plus 1 eps second order.
-constexpr ld K_e = 6.0L;
-// u = (j + F/2) * inv_rho: addition, division and product = 3 roundings.
-constexpr ld K_div = 3.0L;
-static_assert(K_src <= 16.0L && K_acc <= 16.0L && K_w <= 16.0L && K_ref <= 16.0L &&
-                  K_chain <= 16.0L && K_sum <= 16.0L && K_e <= 16.0L && K_div <= 16.0L,
-              "every factor must not exceed 16");
-
-const ld EPS_LD = std::numeric_limits<ld>::epsilon();
-const ld U_LD = 0.5L * EPS_LD;
-
-// Sum of magnitudes of the terms of s_anti + s_sym at direction q.
-ld source_scale(int q, const ld (&u)[L::D], const ld (&F)[L::D]) {
-    const ld a = L::inv_cs2<ld>();
-    ld cu = 0.0L, cF = 0.0L, uF = 0.0L;
-    for (int d = 0; d < L::D; ++d) {
-        cu += std::abs(static_cast<ld>(L::c(q, d))) * std::abs(u[d]);
-        cF += std::abs(static_cast<ld>(L::c(q, d))) * std::abs(F[d]);
-        uF += std::abs(u[d]) * std::abs(F[d]);
-    }
-    return L::w<ld>(q) * (a * a * cu * cF + a * uF + a * cF);
-}
-
-// Same magnitudes as in lbm::equilibrium_shifted (test_equilibrium.cpp).
-ld scale_e(int q, ld drho, const ld (&u)[L::D]) {
-    const ld rho = 1.0L + drho;
-    const ld a = L::inv_cs2<ld>();
-    ld cu = 0.0L, uu = 0.0L;
-    for (int d = 0; d < L::D; ++d) {
-        cu += L::c(q, d) * u[d];
-        uu += u[d] * u[d];
-    }
-    return L::w<ld>(q) *
-           (std::abs(drho) + rho * (a * std::abs(cu) + 0.5L * a * a * cu * cu + 0.5L * a * uu));
-}
 
 } // namespace
 
@@ -198,7 +109,7 @@ TYPED_TEST(ForceTest, SourceParity) {
 // Bound for a sum with weights g_q in {|1|, |c_a|, |c_a c_b|} (exact factors):
 //   (K_src + K_acc + K_w) u sum_q g_q W_q   [source roundings, accumulation,
 //                                            weight representation]
-// plus K_ref u (|u_a F_b| + |u_b F_a|) for the computed reference of the last
+// plus K_uF u (|u_a F_b| + |u_b F_a|) for the computed reference of the last
 // identity.
 TEST(ForceSource, MomentsInLongDouble) {
     for (const auto& fc : kF)
@@ -210,7 +121,7 @@ TEST(ForceSource, MomentsInLongDouble) {
                 lbm::guo_source_parts<L, ld>(q, u, F, sa[q], ss[q]);
                 W[q] = source_scale(q, u, F);
             }
-            const ld k = (K_src + K_acc + K_w) * U_LD;
+            const ld k = (K_src + K_acc + K_w) * kULd;
 
             ld m0a = 0, m0s = 0, W0 = 0;
             for (int q = 0; q < L::Q; ++q) {
@@ -229,7 +140,7 @@ TEST(ForceSource, MomentsInLongDouble) {
                     m1s += c * ss[q];
                     W1 += std::abs(c) * W[q];
                 }
-                EXPECT_LE(std::abs(m1a - F[a]), k * W1 + K_ref * U_LD * std::abs(F[a])) << "a = " << a;
+                EXPECT_LE(std::abs(m1a - F[a]), k * W1 + K_uF * kULd * std::abs(F[a])) << "a = " << a;
                 EXPECT_LE(std::abs(m1s), k * W1) << "a = " << a;
 
                 for (int b = 0; b < L::D; ++b) {
@@ -241,7 +152,7 @@ TEST(ForceSource, MomentsInLongDouble) {
                     }
                     const ld ref = u[a] * F[b] + u[b] * F[a];
                     const ld ref_mag = std::abs(u[a] * F[b]) + std::abs(u[b] * F[a]);
-                    EXPECT_LE(std::abs(m2 - ref), k * W2 + K_ref * U_LD * ref_mag)
+                    EXPECT_LE(std::abs(m2 - ref), k * W2 + K_uF * kULd * ref_mag)
                         << "a = " << a << ", b = " << b;
                 }
             }
@@ -332,17 +243,17 @@ TEST(ForceCollide, ConservesMassAndMomentumChangeIsF) {
                     mass_out += out[q];
                     for (int d = 0; d < L::D; ++d) j_out[d] += L::c(q, d) * out[q];
                 }
-                const ld test_sums = K_sum * EPS_LD * (S + S_out);
+                const ld test_sums = K_sum * kEpsLd * (S + S_out);
 
-                const ld tol_mass = wp * (K_sum * EPS_LD * S + (K_e * EPS_LD + K_w * U_LD) * sum_scale) +
-                                    K_chain * U_LD * sum_chain + (K_src + K_w) * U_LD * sum_W + test_sums;
+                const ld tol_mass = wp * (K_sum * kEpsLd * S + (K_e * kEpsLd + K_w * kULd) * sum_scale) +
+                                    K_chain * kULd * sum_chain + (K_src + K_w) * kULd * sum_W + test_sums;
                 EXPECT_LE(std::abs(mass_out - mass_in), tol_mass)
                     << "mass, nu = " << p.nu << ", drho = " << st.drho;
 
                 for (int d = 0; d < L::D; ++d) {
-                    const ld tol_j = wm * (K_sum * EPS_LD * S + (K_e * EPS_LD + K_w * U_LD) * sc[d] +
-                                           K_div * U_LD * (S + 0.5L * std::abs(F[d]))) +
-                                     K_chain * U_LD * schain[d] + (K_src + K_w) * U_LD * sW[d] +
+                    const ld tol_j = wm * (K_sum * kEpsLd * S + (K_e * kEpsLd + K_w * kULd) * sc[d] +
+                                           K_div * kULd * (S + 0.5L * std::abs(F[d]))) +
+                                     K_chain * kULd * schain[d] + (K_src + K_w) * kULd * sW[d] +
                                      test_sums;
                     EXPECT_LE(std::abs((j_out[d] - j_in[d]) - F[d]), tol_j)
                         << "momentum d = " << d << ", nu = " << p.nu << ", drho = " << st.drho
@@ -434,12 +345,12 @@ TYPED_TEST(ForceTest, CompositionFromParts) {
 //                     [one subtraction per term and the accumulation]
 //   reference Pi:     (K_acc + 2) u wp sum g |fneq_q|
 //                     [accumulation, product wp * Pi, final sum]
-//   reference u F:    (K_ref + 2) u c1 (|u_a F_b| + |u_b F_a|)
+//   reference u F:    (K_uF + 2) u c1 (|u_a F_b| + |u_b F_a|)
 //                     [3 roundings in u_a F_b + u_b F_a, product by c1, final
 //                      sum], c1 = fl(1 - wp/2).
 constexpr ld K_tst = K_acc + 1.0L;
 constexpr ld K_refPi = K_acc + 2.0L;
-constexpr ld K_refF = K_ref + 2.0L;
+constexpr ld K_refF = K_uF + 2.0L;
 static_assert(K_tst <= 16.0L && K_refPi <= 16.0L && K_refF <= 16.0L,
               "every factor must not exceed 16");
 
@@ -492,7 +403,7 @@ TEST(ForceCollide, SecondMomentIncludesSymmetricSource) {
                     const ld uF_mag = std::abs(u[a] * F[b]) + std::abs(u[b] * F[a]);
                     const ld rhs = -wp * pi + c1 * uF;
 
-                    const ld tol = U_LD * (K_chain * sum_chain + (K_src + K_w) * sum_W +
+                    const ld tol = kULd * (K_chain * sum_chain + (K_src + K_w) * sum_W +
                                            K_tst * sum_io + K_refPi * wp * sum_fneq +
                                            K_refF * c1 * uF_mag);
                     EXPECT_LE(std::abs(lhs - rhs), tol)

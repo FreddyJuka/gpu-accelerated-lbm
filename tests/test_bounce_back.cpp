@@ -25,41 +25,18 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
-using L = lbm::D2Q9;
-using Grid = lbm::Grid2D<L>;
+using namespace lbmtest;
 using lbm::NodeType;
 
 namespace {
 
 constexpr int NX = 9;
 constexpr int NY = 5;
-constexpr int WX = 4; // G2 wall node
-constexpr int WY = 2;
-
-// Collision policy that leaves the populations unchanged (pure propagation).
-struct IdentityCollision {
-    template <typename Lat, typename T>
-    LBM_HD void collide(T (&)[Lat::Q]) const {}
-};
-
-enum class Geometry { Channel, SingleWall };
 
 const char* name(Geometry geo) { return geo == Geometry::Channel ? "G1 channel" : "G2 single wall"; }
-
-std::vector<NodeType> make_flags(const Grid& g, Geometry geo) {
-    std::vector<NodeType> flags(static_cast<std::size_t>(g.num_nodes()), NodeType::Fluid);
-    for (int y = 0; y < g.ny(); ++y)
-        for (int x = 0; x < g.nx(); ++x) {
-            const bool wall = (geo == Geometry::Channel) ? (y == 0 || y == g.ny() - 1)
-                                                         : (x == WX && y == WY);
-            if (wall) flags[static_cast<std::size_t>(g.node(x, y))] = NodeType::Wall;
-        }
-    return flags;
-}
-
-int mod(int a, int n) { return ((a % n) + n) % n; }
 
 bool is_wall(const Grid& g, const std::vector<NodeType>& flags, int x, int y) {
     return flags[static_cast<std::size_t>(g.node(mod(x, g.nx()), mod(y, g.ny())))] == NodeType::Wall;
@@ -76,39 +53,6 @@ template <typename T>
 class BounceBack : public ::testing::Test {};
 using PrecisionTypes = ::testing::Types<float, double>;
 TYPED_TEST_SUITE(BounceBack, PrecisionTypes);
-
-// Distinct, exactly representable values: q*1000 + node index (< 9000 < 2^24).
-template <typename T>
-std::vector<T> distinct_field(const Grid& g) {
-    std::vector<T> f(static_cast<std::size_t>(L::Q * g.num_nodes()));
-    for (int q = 0; q < L::Q; ++q)
-        for (int y = 0; y < g.ny(); ++y)
-            for (int x = 0; x < g.nx(); ++x)
-                f[static_cast<std::size_t>(g.idx(q, x, y))] = static_cast<T>(q * 1000 + g.node(x, y));
-    return f;
-}
-
-// Non-uniform shifted populations: equilibrium of a smooth drho/u field plus
-// the deterministic perturbation p_q = 1e-3 * w_q * m_q, m_q = ((3q+1) mod 7) - 3
-// (as in test_moments.cpp).
-template <typename T>
-std::vector<T> nonuniform_field(const Grid& g) {
-    std::vector<T> f(static_cast<std::size_t>(L::Q * g.num_nodes()));
-    for (int y = 0; y < g.ny(); ++y)
-        for (int x = 0; x < g.nx(); ++x) {
-            const T drho = T(0.01) * static_cast<T>(x) - T(0.005) * static_cast<T>(y);
-            const T u[2] = {T(0.02) + T(0.004) * static_cast<T>(y),
-                            T(-0.01) + T(0.003) * static_cast<T>(x)};
-            for (int q = 0; q < L::Q; ++q) {
-                const T p = T(1e-3) * L::w<T>(q) * static_cast<T>(((3 * q + 1) % 7) - 3);
-                f[static_cast<std::size_t>(g.idx(q, x, y))] =
-                    lbm::equilibrium_shifted<L, T>(q, drho, u) + p;
-            }
-        }
-    return f;
-}
-
-const Geometry kGeometries[] = {Geometry::Channel, Geometry::SingleWall};
 
 } // namespace
 

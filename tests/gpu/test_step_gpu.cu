@@ -21,10 +21,10 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
-using L = lbm::D2Q9;
-using Grid = lbm::Grid2D<L>;
+using namespace lbmtest;
 
 namespace {
 
@@ -34,41 +34,6 @@ struct GridSize {
 // 7 x 5: single partial block. 200 x 37: two blocks along x, the second one
 // partial (72 of 128 threads active).
 const GridSize kSizes[] = {{7, 5}, {200, 37}};
-
-// Non-uniform shifted populations: equilibrium of a smooth drho/u field plus
-// the deterministic perturbation p_q = 1e-3 * w_q * m_q, m_q = ((3q+1) mod 7) - 3.
-template <typename T>
-std::vector<T> nonuniform_field(const Grid& g) {
-    std::vector<T> f(static_cast<std::size_t>(L::Q * g.num_nodes()));
-    for (int y = 0; y < g.ny(); ++y)
-        for (int x = 0; x < g.nx(); ++x) {
-            const T drho = T(0.01) * static_cast<T>(x % 11) - T(0.005) * static_cast<T>(y % 7);
-            const T u[2] = {T(0.02) + T(0.004) * static_cast<T>(y % 5),
-                            T(-0.01) + T(0.003) * static_cast<T>(x % 9)};
-            for (int q = 0; q < L::Q; ++q) {
-                const T p = T(1e-3) * L::w<T>(q) * static_cast<T>(((3 * q + 1) % 7) - 3);
-                f[static_cast<std::size_t>(g.idx(q, x, y))] =
-                    lbm::equilibrium_shifted<L, T>(q, drho, u) + p;
-            }
-        }
-    return f;
-}
-
-// Geometries: G1 = channel (walls on rows y = 0 and y = ny-1), G2 = a single
-// interior wall node at (nx/2, ny/2).
-enum class Geometry { Channel, SingleWall };
-const Geometry kGeometries[] = {Geometry::Channel, Geometry::SingleWall};
-
-std::vector<lbm::NodeType> make_flags(const Grid& g, Geometry geo) {
-    std::vector<lbm::NodeType> flags(static_cast<std::size_t>(g.num_nodes()), lbm::NodeType::Fluid);
-    for (int y = 0; y < g.ny(); ++y)
-        for (int x = 0; x < g.nx(); ++x) {
-            const bool wall = (geo == Geometry::Channel) ? (y == 0 || y == g.ny() - 1)
-                                                         : (x == g.nx() / 2 && y == g.ny() / 2);
-            if (wall) flags[static_cast<std::size_t>(g.node(x, y))] = lbm::NodeType::Wall;
-        }
-    return flags;
-}
 
 std::string label(const GridSize& s, Geometry geo) {
     return std::to_string(s.nx) + "x" + std::to_string(s.ny) +

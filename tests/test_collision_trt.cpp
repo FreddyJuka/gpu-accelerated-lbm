@@ -12,27 +12,13 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
+#include "support/error_bounds.hpp"
+#include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
-using L = lbm::D2Q9;
-using ld = long double;
+using namespace lbmtest;
 
 namespace {
-
-struct State {
-    double drho;
-    double ux, uy;
-};
-
-// Same low-Mach state set as test_moments.cpp.
-std::vector<State> low_mach_states() {
-    const double drhos[] = {0.0, 0.01, -0.02};
-    const double us[][2] = {{0.0, 0.0}, {0.05, 0.0}, {0.0, -0.03}, {0.04, 0.07}};
-    std::vector<State> s;
-    for (double r : drhos)
-        for (const auto& u : us) s.push_back({r, u[0], u[1]});
-    return s;
-}
 
 struct Params {
     double nu;
@@ -41,22 +27,11 @@ struct Params {
 constexpr Params P1{0.01, 3.0 / 16.0};  // tau+ = 0.53, tau- = 6.75: omega+ != omega-
 constexpr Params P2{1.0 / 6.0, 0.25};   // tau+ = tau- = 1: omega+ = omega- = 1
 
-static_assert(std::numeric_limits<ld>::digits >= 64,
-              "long double must be extended precision for the reference");
-
 // ---------------------------------------------------------------------------
-// Error-bound constants. u = eps/2 is the unit roundoff of the type in
-// question. Each is an upper bound on a derived count, with the headroom
-// stated; none is fitted to data.
+// Error-bound constants. K_sum, K_u and K_e (summation of Q terms, division and
+// product u_d = j_d * inv_rho, shifted equilibrium) are defined with their
+// derivations in support/error_bounds.hpp. The two below belong to this file.
 // ---------------------------------------------------------------------------
-// Summation of Q terms (moments_shifted, test_moments.cpp): (Q-1) u = (Q-1)/2
-// eps, plus 1/2 eps for the O(n u) second-order factor.
-constexpr ld K_sum = L::Q / 2.0L;
-// u_d = j_d * inv_rho (test_moments.cpp): 1.5 eps |u| plus 1/2 eps headroom.
-constexpr ld K_u = 2.0L;
-// Shifted equilibrium (test_equilibrium.cpp): 10 u = 5 eps on the sum of term
-// magnitudes, plus 1 eps for second-order factors.
-constexpr ld K_e = 6.0L;
 // Second-order factor on the rounding terms of the collision chain: the chain
 // has at most 8 roundings per quantity, (1+u)^8 - 1 - 8u < 40 u^2, and the
 // bounds use first-order magnitudes. Doubling the u-terms covers this by a
@@ -67,8 +42,7 @@ constexpr ld K_h = 2.0L;
 //   omega_minus         : (3 u tau+/d + 3 u) + u_T, bounded by 2 eps (tau+/d + 1) + 0.5 eps_T
 //   reference in ld     : at most 3 u_ld = 1.5 eps_ld, bounded by 2 eps_ld
 constexpr ld K_par = 2.0L;
-static_assert(K_sum <= 16.0L && K_u <= 16.0L && K_e <= 16.0L && K_h <= 16.0L &&
-                  K_par <= 16.0L && K_sum + 1.0L <= 16.0L,
+static_assert(K_h <= 16.0L && K_par <= 16.0L && K_sum + 1.0L <= 16.0L,
               "every factor must not exceed 16");
 
 // TRT can only be obtained through its named constructors.
@@ -78,36 +52,10 @@ constexpr bool trt_is_sealed =
 static_assert(trt_is_sealed<float> && trt_is_sealed<double>,
               "TRT must not be an aggregate nor default-constructible");
 
-template <typename T>
-ld eps_of() {
-    return static_cast<ld>(std::numeric_limits<T>::epsilon());
-}
-const ld EPS_LD = std::numeric_limits<ld>::epsilon();
-
 // ---------------------------------------------------------------------------
-// Moments and equilibrium: bounds carried over from test_moments.cpp and
-// test_equilibrium.cpp.
+// Moments and equilibrium: the bounds (tol_u_from, scale_e) are shared, see
+// support/error_bounds.hpp.
 // ---------------------------------------------------------------------------
-// Division and product u_d = j_d * inv_rho (test_moments.cpp):
-//   |u~ - u| <= E (1 + |u|)/rho + K_u eps |u|,  E = absolute error of drho, j.
-ld tol_u_from(ld E, ld eps, ld rho, ld absu) {
-    return E * (1.0L + absu) / rho + K_u * eps * absu;
-}
-
-// Sum of magnitudes of the terms of f~eq_q (test_equilibrium.cpp), the scale of
-// its rounding error: |err| <= K_e eps scale_e.
-ld scale_e(int q, ld drho, const ld (&u)[L::D]) {
-    const ld rho = 1.0L + drho;
-    const ld inv_cs2 = L::inv_cs2<ld>();
-    ld cu = 0.0L, uu = 0.0L;
-    for (int d = 0; d < L::D; ++d) {
-        cu += L::c(q, d) * u[d];
-        uu += u[d] * u[d];
-    }
-    return L::w<ld>(q) * (std::abs(drho) + rho * (inv_cs2 * std::abs(cu) +
-                                                  0.5L * inv_cs2 * inv_cs2 * cu * cu +
-                                                  0.5L * inv_cs2 * uu));
-}
 
 // Propagation of an input perturbation through the equilibrium. With
 //   g = drho + (1 + drho) P(u),   P = a cu + a^2 cu^2 / 2 - a uu / 2,  a = inv_cs2,
@@ -161,7 +109,7 @@ struct Analysis {
 
 template <typename T>
 Analysis analyse(const T (&f)[L::Q]) {
-    const ld eps_t = eps_of<T>();
+    const ld eps_t = kEps<T>;
     Analysis a;
     a.S = 0.0L;
     for (int q = 0; q < L::Q; ++q) {
@@ -172,17 +120,17 @@ Analysis analyse(const T (&f)[L::Q]) {
     a.rho = 1.0L + a.drho;
 
     const ld alpha_t = K_sum * eps_t * a.S;
-    const ld alpha_l = K_sum * EPS_LD * a.S;
+    const ld alpha_l = K_sum * kEpsLd * a.S;
     ld beta_t[L::D], beta_l[L::D];
     for (int d = 0; d < L::D; ++d) {
         beta_t[d] = tol_u_from(alpha_t, eps_t, a.rho, std::abs(a.u[d]));
-        beta_l[d] = tol_u_from(alpha_l, EPS_LD, a.rho, std::abs(a.u[d]));
+        beta_l[d] = tol_u_from(alpha_l, kEpsLd, a.rho, std::abs(a.u[d]));
     }
     for (int q = 0; q < L::Q; ++q) {
         a.feq[q] = lbm::equilibrium_shifted<L, ld>(q, a.drho, a.u);
         a.scale[q] = scale_e(q, a.drho, a.u);
         a.E_T[q] = delta_eq(q, a.drho, a.u, alpha_t, beta_t) + K_e * eps_t * a.scale[q];
-        a.E_L[q] = delta_eq(q, a.drho, a.u, alpha_l, beta_l) + K_e * EPS_LD * a.scale[q];
+        a.E_L[q] = delta_eq(q, a.drho, a.u, alpha_l, beta_l) + K_e * kEpsLd * a.scale[q];
         a.N[q] = std::abs(a.f[q]) + std::abs(a.feq[q]) + a.E_T[q] + a.E_L[q];
     }
     return a;
@@ -205,26 +153,6 @@ ld eout(const Analysis& a, int q, ld wp, ld wm, ld eps_t) {
     const ld Np = a.N[q] + a.N[o];
     return (wp + wm) * 0.5L * (a.E_T[q] + a.E_T[o]) +
            K_h * 0.5L * eps_t * (Np * (2.5L * wp + 2.0L * wm) + 2.0L * std::abs(a.f[q]));
-}
-
-template <typename T>
-void inputs_from_state(const State& s, T& drho, T (&u)[2], T (&f)[L::Q]) {
-    drho = static_cast<T>(s.drho);
-    u[0] = static_cast<T>(s.ux);
-    u[1] = static_cast<T>(s.uy);
-    for (int q = 0; q < L::Q; ++q) f[q] = lbm::equilibrium_shifted<L, T>(q, drho, u);
-}
-
-// Deterministic non-equilibrium perturbation of test_moments.cpp:
-// p_q = 1e-3 w_q m_q, m_q = ((3q + 1) mod 7) - 3, not symmetric under q -> opp(q).
-template <typename T>
-void perturbed_input(const State& s, T (&f)[L::Q]) {
-    T drho, u[2];
-    inputs_from_state<T>(s, drho, u, f);
-    for (int q = 0; q < L::Q; ++q) {
-        const int m = ((3 * q + 1) % 7) - 3;
-        f[q] = f[q] + T(1e-3) * L::template w<T>(q) * T(m);
-    }
 }
 
 std::string describe(const State& s, const Params& p) {
@@ -269,9 +197,9 @@ Expected expected_from_viscosity(const Params& p) {
     e.tau_m = e.q + 0.5L;
     e.wp = 1.0L / e.tau_p;
     e.wm = 1.0L / e.tau_m;
-    const ld eps_d = eps_of<double>();
-    e.rel_p = K_par * eps_d + 0.5L * eps_of<T>();
-    e.rel_m = K_par * eps_d * (e.tau_p / e.d + 1.0L) + 0.5L * eps_of<T>();
+    const ld eps_d = kEps<double>;
+    e.rel_p = K_par * eps_d + 0.5L * kEps<T>;
+    e.rel_m = K_par * eps_d * (e.tau_p / e.d + 1.0L) + 0.5L * kEps<T>;
     return e;
 }
 
@@ -284,14 +212,14 @@ Expected expected_from_tau(double tau_plus, double lambda) {
     e.tau_m = e.q + 0.5L;
     e.wp = 1.0L / e.tau_p;
     e.wm = 1.0L / e.tau_m;
-    const ld eps_d = eps_of<double>();
-    e.rel_p = 1.0L * eps_d + 0.5L * eps_of<T>();
-    e.rel_m = 2.0L * eps_d + 0.5L * eps_of<T>();
+    const ld eps_d = kEps<double>;
+    e.rel_p = 1.0L * eps_d + 0.5L * kEps<T>;
+    e.rel_m = 2.0L * eps_d + 0.5L * kEps<T>;
     return e;
 }
 
 // Rate bound including the reference's own error.
-ld rate_tol(ld w, ld rel) { return (rel + K_par * EPS_LD) * w; }
+ld rate_tol(ld w, ld rel) { return (rel + K_par * kEpsLd) * w; }
 
 template <typename F>
 void expect_rejected(F&& fn, const char* name, double value) {
@@ -369,7 +297,7 @@ TYPED_TEST(CollisionTRT, LambdaRecoveredFromStoredRates) {
         const ld rm = e.rel_m / (1.0L - e.rel_m);
         const ld a = rp * e.tau_p / e.d;
         const ld b = rm * e.tau_m / e.q;
-        const ld tol = lam * (a + b + a * b) + lam * EPS_LD * (e.tau_p / e.d + e.tau_m / e.q + 3.0L);
+        const ld tol = lam * (a + b + a * b) + lam * kEpsLd * (e.tau_p / e.d + e.tau_m / e.q + 3.0L);
         const ld rec = (1.0L / static_cast<ld>(trt.omega_plus()) - 0.5L) *
                        (1.0L / static_cast<ld>(trt.omega_minus()) - 0.5L);
         EXPECT_LE(std::abs(rec - lam), tol) << "nu = " << p.nu << ", lambda = " << p.lambda;
@@ -455,7 +383,7 @@ TYPED_TEST(CollisionTRT, RestStateStaysExactlyZero) {
 // All u-terms of the chain are multiplied by K_h.
 template <typename T>
 void check_conservation(const lbm::TRT<T>& trt, const Params& p) {
-    const ld eps_t = eps_of<T>();
+    const ld eps_t = kEps<T>;
     const ld u_t = 0.5L * eps_t;
     for (const State& s : low_mach_states()) {
         T f[L::Q];
@@ -488,7 +416,7 @@ void check_conservation(const lbm::TRT<T>& trt, const Params& p) {
                 j_out[d] += L::c(q, d) * static_cast<ld>(out[q]);
             }
         }
-        const ld ld_sums = K_sum * EPS_LD * (a.S + S_out);
+        const ld ld_sums = K_sum * kEpsLd * (a.S + S_out);
 
         const ld tol_mass = wp * (K_sum * eps_t * a.S + K_e * eps_t * sum_scale +
                                   K_h * 3.0L * u_t * sum_N) +
@@ -527,7 +455,7 @@ TYPED_TEST(CollisionTRT, ConservesMassAndMomentumP2) {
 //   K_h u_ld (Op + 3 Np), Op = sum over the pair of |f| + 0.5 (wp + wm) Np.
 TYPED_TEST(CollisionTRT, PairwiseRelaxationP1) {
     using T = TypeParam;
-    const ld eps_t = eps_of<T>();
+    const ld eps_t = kEps<T>;
     const auto trt = this->make(P1);
     const ld wp = trt.omega_plus(), wm = trt.omega_minus();
     ASSERT_GT(std::abs(wp - wm), 1.0L) << "P1 must have distinct rates";
@@ -548,7 +476,7 @@ TYPED_TEST(CollisionTRT, PairwiseRelaxationP1) {
             const ld anti_in = 0.5L * ((a.f[q] - a.feq[q]) - (a.f[o] - a.feq[o]));
             const ld Np = a.N[q] + a.N[o];
             const ld Op = std::abs(a.f[q]) + std::abs(a.f[o]) + (wp + wm) * Np;
-            const ld ld_round = K_h * 0.5L * EPS_LD * (Op + 3.0L * Np);
+            const ld ld_round = K_h * 0.5L * kEpsLd * (Op + 3.0L * Np);
             const ld eo = 0.5L * (eout(a, q, wp, wm, eps_t) + eout(a, o, wp, wm, eps_t));
             const ld el = 0.5L * (a.E_L[q] + a.E_L[o]);
 
@@ -576,7 +504,7 @@ TYPED_TEST(CollisionTRT, PairwiseRelaxationP1) {
 // computed collision adds eout (analysis of the actual input).
 TYPED_TEST(CollisionTRT, EquilibriumIsFixedPoint) {
     using T = TypeParam;
-    const ld eps_t = eps_of<T>();
+    const ld eps_t = kEps<T>;
     for (const Params& p : {P1, P2}) {
         const auto trt = this->make(p);
         const ld wp = trt.omega_plus(), wm = trt.omega_minus();
@@ -627,7 +555,7 @@ TYPED_TEST(CollisionTRT, EquilibriumIsFixedPoint) {
 //   K_h u_ld (N + 2 wp N + |f|).
 TYPED_TEST(CollisionTRT, ReducesToBGKWhenRatesAreEqual) {
     using T = TypeParam;
-    const ld eps_t = eps_of<T>();
+    const ld eps_t = kEps<T>;
     const auto trt = this->make(P2);
     ASSERT_EQ(trt.omega_plus(), trt.omega_minus()) << "P2 must give equal rates";
     const ld wp = trt.omega_plus(), wm = trt.omega_minus();
@@ -641,7 +569,7 @@ TYPED_TEST(CollisionTRT, ReducesToBGKWhenRatesAreEqual) {
         for (int q = 0; q < L::Q; ++q) {
             const ld ref = a.f[q] - wp * (a.f[q] - a.feq[q]);
             const ld tol = eout(a, q, wp, wm, eps_t) + wp * a.E_L[q] +
-                           K_h * 0.5L * EPS_LD * (a.N[q] + 2.0L * wp * a.N[q] + std::abs(a.f[q]));
+                           K_h * 0.5L * kEpsLd * (a.N[q] + 2.0L * wp * a.N[q] + std::abs(a.f[q]));
             const ld err = std::abs(static_cast<ld>(out[q]) - ref);
             EXPECT_LE(err, tol) << "q = " << q << ", " << describe(s, P2) << ", err = " << err
                                 << ", tol = " << tol;

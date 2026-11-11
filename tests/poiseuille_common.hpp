@@ -98,7 +98,7 @@
 //    change r^K/(1 - r^K). `change` is the measured final change of the
 //    respective field.
 //
-//  ref_round: rounding of the long double reference, K_ref u_ld times the sum
+//  ref_round: rounding of the long double reference, K_parabola_ref u_ld times the sum
 //    of magnitudes of its terms, max u_a + F/(2 nu)(16 Lambda + 3)/12.
 //
 // Mean of drho (no physical assumption):
@@ -175,19 +175,17 @@
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
 #include "lbm/propagation/ab_pull.hpp"
+#include "support/error_bounds.hpp"
+#include "support/fields.hpp"
 
 namespace poiseuille {
 
-using L = lbm::D2Q9;
-using Grid = lbm::Grid2D<L>;
+using namespace lbmtest;  // L, Grid, ld, IdentityCollision, the K_* constants, ...
+
 template <typename T>
 using Force = lbm::UniformForce<T, L::D>;
 template <typename T>
 using Collision = lbm::TRT<T, Force<T>>;
-using ld = long double;
-
-static_assert(std::numeric_limits<ld>::digits >= 64,
-              "long double must be extended precision for the reference");
 
 constexpr double kUmax = 0.01;
 constexpr int kNx = 4;
@@ -202,32 +200,17 @@ constexpr double kStopChange =
     (static_cast<double>(std::numeric_limits<T>::epsilon()) / std::numeric_limits<double>::epsilon());
 static_assert(kStopChange<double> == 1e-14 * kUmax, "the double stopping rule must not change");
 
-// Operation-count factors (see the comment above and test_force.cpp).
-constexpr ld K_chain = 14.0L;  // roundings in the update of one out_q
-constexpr ld K_src = 10.0L;    // roundings in guo_source_parts, D = 2
-constexpr ld K_w = 1.0L;       // representation of the weights
-constexpr ld K_sum = L::Q / 2.0L;  // sum of Q terms
-constexpr ld K_e = 6.0L;       // shifted equilibrium
-constexpr ld K_div = 3.0L;     // u = (j + F/2) * inv_rho
-constexpr ld K_ref = 16.0L;    // long double reference chain (at most 12 operations)
-static_assert(K_chain <= 16.0L && K_src <= 16.0L && K_w <= 16.0L && K_sum <= 16.0L &&
-                  K_e <= 16.0L && K_div <= 16.0L && K_ref <= 16.0L,
-              "every factor must not exceed 16");
+// Operation-count factors K_chain, K_src, K_w, K_sum, K_e, K_div are shared and
+// derived in support/error_bounds.hpp. This one belongs to this file:
+// the long double reference chain (the parabola, the slip and the effective
+// parameters) has at most 12 operations, in units of u_ld.
+constexpr ld K_parabola_ref = 16.0L;
+static_assert(K_parabola_ref <= 16.0L, "every factor must not exceed 16");
 
-template <typename T>
-constexpr ld kEps = std::numeric_limits<T>::epsilon();  // of the storage/compute type T
-template <typename T>
-constexpr ld kU = 0.5L * kEps<T>;
 // Rounding of the conversion double -> T of a stored parameter (exact for double).
 template <typename T>
 constexpr ld kUcast = std::is_same_v<T, double> ? 0.0L : kU<T>;
-constexpr ld kUld = 0.5L * std::numeric_limits<ld>::epsilon();
 constexpr ld kPi = 3.14159265358979323846264338327950288L;
-
-struct IdentityCollision {
-    template <typename Lat, typename T>
-    LBM_HD void collide(T (&)[Lat::Q]) const {}
-};
 
 struct Case {
     int H;
@@ -265,18 +248,10 @@ struct ChannelSetup {
     explicit ChannelSetup(const Case& cs)
         : c(cs),
           g(kNx, cs.H + 2),
-          flags(make_flags(kNx, cs.H + 2)),
+          flags(make_flags(g, Geometry::Channel)),
           force(make_force(cs)),
           coll(Collision<T>::template from_viscosity<L>(cs.nu, cs.lambda, force)) {}
 
-    static std::vector<lbm::NodeType> make_flags(int nx, int ny) {
-        std::vector<lbm::NodeType> f(static_cast<std::size_t>(nx * ny), lbm::NodeType::Fluid);
-        for (int x = 0; x < nx; ++x) {
-            f[static_cast<std::size_t>(x)] = lbm::NodeType::Wall;
-            f[static_cast<std::size_t>((ny - 1) * nx + x)] = lbm::NodeType::Wall;
-        }
-        return f;
-    }
     static Force<T> make_force(const Case& cs) {
         const double fc[2] = {8.0 * cs.nu * kUmax / (static_cast<double>(cs.H) * cs.H), 0.0};
         return Force<T>::create(fc);
@@ -299,34 +274,6 @@ struct NodeMass {
     ld mass = 0, meas = 0;
 };
 
-// Sum of magnitudes of the terms of s_anti + s_sym (test_force.cpp).
-template <typename T>
-ld source_scale(int q, const T (&u)[L::D], const T (&F)[L::D]) {
-    const ld a = L::inv_cs2<ld>();
-    ld cu = 0, cF = 0, uF = 0;
-    for (int d = 0; d < L::D; ++d) {
-        cu += std::abs(static_cast<ld>(L::c(q, d))) * std::abs(static_cast<ld>(u[d]));
-        cF += std::abs(static_cast<ld>(L::c(q, d))) * std::abs(static_cast<ld>(F[d]));
-        uF += std::abs(static_cast<ld>(u[d])) * std::abs(static_cast<ld>(F[d]));
-    }
-    return L::w<ld>(q) * (a * a * cu * cF + a * uF + a * cF);
-}
-
-// Sum of magnitudes of the terms of the shifted equilibrium (test_equilibrium.cpp).
-template <typename T>
-ld equilibrium_scale(int q, T drho_d, const T (&u_d)[L::D]) {
-    const ld drho = drho_d;
-    const ld rho = 1.0L + drho;
-    const ld a = L::inv_cs2<ld>();
-    ld cu = 0, uu = 0;
-    for (int d = 0; d < L::D; ++d) {
-        cu += L::c(q, d) * static_cast<ld>(u_d[d]);
-        uu += static_cast<ld>(u_d[d]) * static_cast<ld>(u_d[d]);
-    }
-    return L::w<ld>(q) *
-           (std::abs(drho) + rho * (a * std::abs(cu) + 0.5L * a * a * cu * cu + 0.5L * a * uu));
-}
-
 // delta_step of one node, from its gathered (collision input) populations.
 template <typename T>
 NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (&F)[L::D],
@@ -343,7 +290,7 @@ NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const
     ld sum_scale = 0, sum_chain = 0, sum_W = 0;
     ld sc[L::D] = {0, 0}, schain[L::D] = {0, 0}, sW[L::D] = {0, 0};
     for (int q = 0; q < L::Q; ++q) {
-        const ld scale = equilibrium_scale(q, drho, u);
+        const ld scale = scale_e(q, drho, u);
         const ld W = source_scale(q, u, F);
         const ld Np = N[q] + N[L::opp(q)];
         const ld M = std::abs(static_cast<ld>(f[q])) + 0.5L * (wp + wm) * Np + W;
@@ -427,7 +374,7 @@ Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds
 //   <= u (3 tau+/(3 nu) + 1); tau-_eff - 1/2 adds 2u tau-/q (the sum and 1/tau
 //   roundings, each u tau-).
 // Lambda_eff = (tau+ - 1/2)(tau- - 1/2) has the sum of the relative errors
-// of its two factors (first order; second order is covered by K_ref u_ld).
+// of its two factors (first order; second order is covered by K_parabola_ref u_ld).
 // For T = float each omega is then rounded to T, one more relative error
 // u_c = eps_T/2 of tau_eff (u_c = 0 for double, where the cast is exact):
 // 3u becomes 3u + u_c in the tau+ terms and 2u becomes 2u + u_c in the tau-
@@ -455,8 +402,8 @@ Effective effective_parameters(const ChannelSetup<T>& s) {
     const ld rel_nu = (3.0L * uD + uC) * (1.0L + 1.0L / (6.0L * nu));
     const ld rel_q = uD * (3.0L * tp_nom / (3.0L * nu) + 1.0L);
     const ld rel_lambda = rel_nu + rel_q + (2.0L * uD + uC) * tm_nom / q_nom;
-    EXPECT_LE(std::abs(e.nu / nu - 1.0L), rel_nu + K_ref * kUld) << "effective nu";
-    EXPECT_LE(std::abs(e.lambda / lam - 1.0L), rel_lambda + K_ref * kUld) << "effective lambda";
+    EXPECT_LE(std::abs(e.nu / nu - 1.0L), rel_nu + K_parabola_ref * kULd) << "effective nu";
+    EXPECT_LE(std::abs(e.lambda / lam - 1.0L), rel_lambda + K_parabola_ref * kULd) << "effective lambda";
     return e;
 }
 
@@ -508,7 +455,7 @@ void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
 
     ld ua_max = 0;
     for (int y = 1; y < ny - 1; ++y) ua_max = std::max(ua_max, analytic(y));
-    const ld ref_round = K_ref * kUld * (ua_max + Fx / (2.0L * eff.nu) * (16.0L * eff.lambda + 3.0L) / 12.0L);
+    const ld ref_round = K_parabola_ref * kULd * (ua_max + Fx / (2.0L * eff.nu) * (16.0L * eff.lambda + 3.0L) / 12.0L);
 
     auto tail = [&](T change) { return static_cast<ld>(change) * rK / (1.0L - rK); };
     const ld tol_x = bounds.ux / (1.0L - r) + tail(change_x) + ref_round;
