@@ -26,7 +26,7 @@
 // rates from the comparison; that conversion is tested in
 // test_collision_trt.cpp, and here the effective values are asserted to agree
 // with the nominal ones within their derived rounding bounds (see
-// check_effective_parameters), so a wrong conversion cannot pass.
+// effective_parameters), so a wrong conversion cannot pass.
 //
 // ---------------------------------------------------------------------------
 // Velocity measurement
@@ -68,6 +68,13 @@
 //    monotonically from rest, so the sampled magnitudes bound those between
 //    checks; this is part of the assumption below.)
 //
+//  drho is split into its spatial mean over the fluid nodes and the fluctuation
+//  around it, because the uniform density mode is neutral and is not damped
+//  by r (see "Mean of drho" below):
+//    |mean drho|        <= n mass_mean + meas_mean
+//    |drho - mean drho| <= delta_step,rho / (1 - r) + residual_stop + ...
+//  with the two bounds checked separately; u_x and u_y use the formula above.
+//
 //  r: decay factor per step of the slowest diffusive mode of the channel,
 //    r = exp(-nu_eff pi^2 / (H + 1)^2). Two deliberate differences from the
 //    simplification 1 - nu pi^2 / H^2: exp(-x) >= 1 - x, so r is not smaller
@@ -93,6 +100,26 @@
 //
 //  ref_round: rounding of the long double reference, K_ref u_ld times the sum
 //    of magnitudes of its terms, max u_a + F/(2 nu)(16 Lambda + 3)/12.
+//
+// Mean of drho (no physical assumption):
+//  In exact arithmetic the total mass is conserved by (a) streaming, which is a
+//  permutation of the populations between nodes, (b) halfway bounce-back, which
+//  reflects a population onto its opposite direction at the same node (a
+//  permutation as well), and (c) the collision, whose zeroth moment is
+//  unchanged (TRT relaxes only non-conserved moments, the equilibrium has the
+//  same density, and the Guo source has zero zeroth moment). Streaming and
+//  bounce-back copy values and are exact also in floating point, so the
+//  only mass change per step is the round-off of the collision, bounded per
+//  node by tol_mass. The mass errors do not decay (the uniform mode has no
+//  relaxation) but add up: after n steps
+//    |mean drho| <= n mass_mean + meas_mean,
+//  where mass_mean is the mean over the fluid nodes of the per-node tol_mass
+//  (maximum over the checks, as for delta_step) and meas_mean the mean of the
+//  rounding K_sum eps S of the measurement sum, which enters once. n is the
+//  number of steps actually run. The bound is linear in n and therefore only
+//  useful for runs where n eps is small compared to the tolerance wanted; it
+//  is nevertheless a proven bound, which is the point. The fluctuation keeps
+//  the decay assumption (b) above for the non-uniform density perturbations.
 //
 // No factor was chosen by trying values against data.
 //
@@ -263,6 +290,13 @@ struct Fields {
 
 struct Bounds {
     ld ux = 0, uy = 0, rho = 0;  // delta_step per field
+    ld mass_mean = 0;            // mean over the fluid nodes of tol_mass (max over checks)
+    ld meas_mean = 0;            // mean over the fluid nodes of the measurement rounding of drho
+};
+
+// Per-node contributions to the mean bounds, summed by measure().
+struct NodeMass {
+    ld mass = 0, meas = 0;
 };
 
 // Sum of magnitudes of the terms of s_anti + s_sym (test_force.cpp).
@@ -295,8 +329,8 @@ ld equilibrium_scale(int q, T drho_d, const T (&u_d)[L::D]) {
 
 // delta_step of one node, from its gathered (collision input) populations.
 template <typename T>
-void accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (&F)[L::D], ld wp,
-                       ld wm, Bounds& b) {
+NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (&F)[L::D],
+                           ld wp, ld wm, Bounds& b) {
     const ld eps = kEps<T>;
     const ld uT = kU<T>;
     ld N[L::Q];
@@ -340,6 +374,7 @@ void accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (
     b.ux = std::max(b.ux, du[0]);
     b.uy = std::max(b.uy, du[1]);
     b.rho = std::max(b.rho, d_rho);
+    return {tol_mass, K_sum * eps * S};
 }
 
 // Fields of the stored post-collision populations, measured on the gathered
@@ -358,6 +393,8 @@ Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds
     r.uy.assign(n, T(0));
     r.drho.assign(n, T(0));
     const T F[2] = {s.force.F(0), s.force.F(1)};
+    ld sum_mass = 0, sum_meas = 0;
+    long fluid = 0;
     for (int y = 0; y < g.ny(); ++y)
         for (int x = 0; x < g.nx(); ++x) {
             if (s.flags[static_cast<std::size_t>(g.node(x, y))] == lbm::NodeType::Wall) continue;
@@ -368,8 +405,14 @@ Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds
             r.ux[i] = u[0];
             r.uy[i] = u[1];
             r.drho[i] = drho;
-            accumulate_bounds(f, drho, u, F, s.coll.omega_plus(), s.coll.omega_minus(), bounds);
+            const NodeMass m = accumulate_bounds(f, drho, u, F, s.coll.omega_plus(),
+                                                 s.coll.omega_minus(), bounds);
+            sum_mass += m.mass;
+            sum_meas += m.meas;
+            ++fluid;
         }
+    bounds.mass_mean = std::max(bounds.mass_mean, sum_mass / static_cast<ld>(fluid));
+    bounds.meas_mean = std::max(bounds.meas_mean, sum_meas / static_cast<ld>(fluid));
     return r;
 }
 
@@ -470,15 +513,23 @@ void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
     auto tail = [&](T change) { return static_cast<ld>(change) * rK / (1.0L - rK); };
     const ld tol_x = bounds.ux / (1.0L - r) + tail(change_x) + ref_round;
     const ld tol_y = bounds.uy / (1.0L - r) + tail(change_y);
-    const ld tol_rho = bounds.rho / (1.0L - r) + tail(change_rho);
+    // Mean (accumulates over the steps run) and fluctuation (decays), see "Mean of drho".
+    const ld tol_rho_mean = static_cast<ld>(steps) * bounds.mass_mean + bounds.meas_mean;
+    const ld tol_rho = bounds.rho / (1.0L - r) + tail(change_rho);  // fluctuation
 
-    ld err_x = 0, err_y = 0, err_rho = 0;
+    ld err_x = 0, err_y = 0, err_rho = 0, mean_rho = 0;
     for (int y = 1; y < ny - 1; ++y)
         for (int x = 0; x < kNx; ++x) {
             const std::size_t i = static_cast<std::size_t>(g.node(x, y));
             err_x = std::max(err_x, std::abs(static_cast<ld>(cur.ux[i]) - (analytic(y) + du)));
             err_y = std::max(err_y, std::abs(static_cast<ld>(cur.uy[i])));
-            err_rho = std::max(err_rho, std::abs(static_cast<ld>(cur.drho[i])));
+            mean_rho += static_cast<ld>(cur.drho[i]);
+        }
+    mean_rho /= static_cast<ld>((ny - 2) * kNx);
+    for (int y = 1; y < ny - 1; ++y)
+        for (int x = 0; x < kNx; ++x) {
+            const std::size_t i = static_cast<std::size_t>(g.node(x, y));
+            err_rho = std::max(err_rho, std::abs(static_cast<ld>(cur.drho[i]) - mean_rho));
         }
 
     std::cout << "[ info ] " << case_name(c) << (sizeof(T) == sizeof(float) ? " float" : " double")
@@ -487,11 +538,14 @@ void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
               << static_cast<double>(err_x / kUmax) << " (tol "
               << static_cast<double>(tol_x / kUmax) << "), err_y " << static_cast<double>(err_y)
               << " (tol " << static_cast<double>(tol_y) << "), err_rho "
-              << static_cast<double>(err_rho) << " (tol " << static_cast<double>(tol_rho) << ")\n";
+              << static_cast<double>(err_rho) << " (tol " << static_cast<double>(tol_rho)
+              << "), mean_rho " << static_cast<double>(std::abs(mean_rho)) << " (tol "
+              << static_cast<double>(tol_rho_mean) << ")\n";
 
     EXPECT_LE(err_x, tol_x) << "u_x vs u_a + du, " << case_name(c);
     EXPECT_LE(err_y, tol_y) << "u_y, " << case_name(c);
-    EXPECT_LE(err_rho, tol_rho) << "drho, " << case_name(c);
+    EXPECT_LE(err_rho, tol_rho) << "drho fluctuation, " << case_name(c);
+    EXPECT_LE(std::abs(mean_rho), tol_rho_mean) << "drho mean, " << case_name(c);
 
     // The tolerance must be below the slip, otherwise a result that ignores
     // the slip could pass.
