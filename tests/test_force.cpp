@@ -1,18 +1,20 @@
 // Tests of the Guo body force: source parts, forced moments and the forced TRT
 // collision.
 //
-// Accuracy of the T-precision forced collision against a long double
-// reference is deferred to a later task (the helpers it needs are in
-// support/error_bounds.hpp). Here:
+// Here:
 //   a. regression against the unforced collision (exact),
 //   b. parity of the source parts (exact),
 //   c, d. semantics of the scheme (source moments, mass and momentum change)
 //         in long double, where rounding is negligible and bounded explicitly,
 //   e. composition of the forced collision from its parts (exact),
-//   f. factory validation.
+//   f. factory validation,
+//   g. second moment of the collision including the symmetric source,
+//   h. accuracy of the T-precision forced collision against the same library
+//      code in long double (float and double).
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -422,6 +424,300 @@ TEST(ForceCollide, SecondMomentIncludesSymmetricSource) {
         }
     }
     ASSERT_GT(checked_nonzero, 0);
+}
+
+// h. Accuracy of the forced TRT collision in T (float, double) against
+// TRT<long double, UniformForce<long double, 2>>::collide on the same inputs.
+//
+// The reference is the same library code evaluated in long double, so this
+// test checks rounding, not the formula; the formula is covered by the long
+// double moment tests (c, d) and ForceCollide.SecondMomentIncludesSymmetricSource.
+// The rates and the force of the reference are those of the T object, converted
+// exactly (see matched_params), so parameter conversion does not enter.
+//
+// Derivation of the bound on |out_T,q - out_L,q| (u_T = eps_T/2, u_L = eps_ld/2).
+// Both results are compared with out*, the exact collision with the exact
+// moments of the T input, and the two deviations are added. For X = T, L:
+//   moments:  |drho_X - drho| <= alpha_X = K_sum eps_X S, S = sum|f|, and the
+//     same bound for every j_d (the products c f are exact).
+//   velocity: u_X = fl(fl(j_X + F/2) inv_rho_X), see forced_velocity_bound:
+//     one rounding for the sum with F/2 (exact), the rounding of rho = 1 + drho,
+//     the division and the product. |u_X - u| <= beta_X.
+//   equilibrium: E_X[q] = eq_perturbation(alpha_X, beta_X) + K_e eps_X scale_e
+//     (propagation of the moment errors through the polynomial, then the
+//     rounding of the evaluation), as in test_collision_trt.cpp.
+//   source: s_sym is linear in u, so the velocity error changes it by at most
+//     dsrc_X[q] = w (a^2 (sum|c| beta_X)(sum|c F|) + a sum beta_X |F|) exactly
+//     (s_anti does not depend on u); it enters multiplied by c_p = 1 - wp/2.
+//     Its own roundings are bounded by (K_src + K_w) u_X W_q.
+//   chain:    the 14 roundings of out_q (K_chain) on a quantity bounded by
+//     M_q + N_q + N_opp, with M_q = |f_q| + (wp + wm)/2 (N_q + N_opp) + W_q,
+//     N_q = |f_q| + |feq_ref_q| + E_T + E_L and W_q = source_scale at |u| + beta_T
+//     (the bounds as in test d). K_chain_hd = K_chain + 2 holds the second-order
+//     terms of (1 + u)^14 - 1 - 14u <= 91 u^2 <= 2 u (u <= 1/45).
+//   The equilibrium errors are relaxed by 0.5 (wp + wm) (E_q + E_opp) (the two
+//   relaxation terms, as in eout of test_collision_trt.cpp).
+// Total:
+//   0.5 (wp + wm) (E_T[q] + E_T[opp] + E_L[q] + E_L[opp])
+//   + c_p (dsrc_T + dsrc_L)
+//   + [(K_src + K_w) W_q + K_chain_hd (M_q + Np)] (u_T + u_L)
+//   + u_L (|out_T| + |out_L|)            [the long double subtraction of the test]
+// All factors are <= 16 (static_assert); no factor was chosen against the data.
+namespace {
+
+constexpr ld K_chain_hd = K_chain + 2.0L;
+static_assert(K_chain_hd <= 16.0L && K_src + K_w <= 16.0L, "every factor must not exceed 16");
+static_assert(std::numeric_limits<ld>::digits >= 64,
+              "long double must be extended precision for the reference");
+
+// Bound on |fl(1 + drho~) - rho| for |drho~ - drho| <= E, rho = 1 + drho.
+ld rho_error(ld E, ld u, ld rho) { return E + u * (rho + E); }
+
+// Bound on |u_c - u| of u_c = fl(fl(j~ + F/2) inv_rho~), inv_rho~ = fl(1 / fl(1 + drho~)),
+// |drho~ - drho| <= E, |j~ - j| <= E, u = (j + F/2)/rho the exact velocity, u the
+// unit roundoff of the type. d = rho_error bounds the error of rho~; then
+//   |1/rho~ - 1/rho| <= (1/rho) d/(rho - d)   (requires d < rho, asserted by the test)
+//   inv_rho~ = (1/rho)(1 + eta),  |eta| <= (d/(rho - d))(1 + u) + u
+//   u_c = (A + e_j)(1 + th1)(1 + th2)(1 + eta)/rho,  A = j + F/2, |e_j| <= E,
+//   |u_c - u| <= |u| (P - 1) + (E/rho) P,  P = (1 + u)^2 (1 + |eta|).
+ld forced_velocity_bound(ld E, ld u, ld rho, ld absu) {
+    const ld d = rho_error(E, u, rho);
+    const ld eta = (d / (rho - d)) * (1.0L + u) + u;
+    const ld P = (1.0L + u) * (1.0L + u) * (1.0L + eta);
+    return absu * (P - 1.0L) + (E / rho) * P;
+}
+
+// Propagation of the moment errors (alpha on drho, beta on u) through the
+// shifted equilibrium; the same expression as delta_eq in test_collision_trt.cpp
+// (derivation there).
+ld eq_perturbation(int q, ld drho, const ld (&u)[L::D], ld alpha, const ld (&beta)[L::D]) {
+    const ld a = L::inv_cs2<ld>();
+    const ld rho = 1.0L + drho;
+    ld cu = 0.0L, uu = 0.0L, cb = 0.0L, ub = 0.0L, bb = 0.0L;
+    for (int d = 0; d < L::D; ++d) {
+        cu += L::c(q, d) * u[d];
+        uu += u[d] * u[d];
+        cb += std::abs(static_cast<ld>(L::c(q, d))) * beta[d];
+        ub += std::abs(u[d]) * beta[d];
+        bb += beta[d] * beta[d];
+    }
+    const ld absP = a * std::abs(cu) + 0.5L * a * a * cu * cu + 0.5L * a * uu;
+    const ld dP = a * cb + a * a * std::abs(cu) * cb + 0.5L * a * a * cb * cb + a * ub +
+                  0.5L * a * bb;
+    return L::w<ld>(q) * (alpha * (1.0L + absP + dP) + rho * dP);
+}
+
+// Change of s_sym (the only u-dependent source part, linear in u) for a
+// velocity error of at most beta.
+ld source_velocity_error(int q, const ld (&F)[L::D], const ld (&beta)[L::D]) {
+    const ld a = L::inv_cs2<ld>();
+    ld cb = 0.0L, cF = 0.0L, bF = 0.0L;
+    for (int d = 0; d < L::D; ++d) {
+        cb += std::abs(static_cast<ld>(L::c(q, d))) * beta[d];
+        cF += std::abs(static_cast<ld>(L::c(q, d))) * std::abs(F[d]);
+        bF += beta[d] * std::abs(F[d]);
+    }
+    return L::w<ld>(q) * (a * a * cb * cF + a * bF);
+}
+
+double step_ulps(double x, int n) {
+    const double dir = n > 0 ? std::numeric_limits<double>::infinity()
+                             : -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < std::abs(n); ++i) x = std::nextafter(x, dir);
+    return x;
+}
+
+// tau such that fl(1 / tau) == r, searched a few ulps around 1/r (the map
+// tau -> fl(1/tau) is not onto: for rates of magnitude > 1 some doubles are
+// skipped). Returns 0 if none is found.
+double tau_for_rate(double r) {
+    const double t0 = 1.0 / r;
+    for (int i = 0; i <= 8; ++i)
+        for (int sgn : {1, -1}) {
+            const double t = step_ulps(t0, sgn * i);
+            if (1.0 / t == r) return t;
+        }
+    return 0.0;
+}
+
+// Parameters (tau_plus, lambda) for TRT::from_tau such that the rates
+// computed in double are exactly representable in T. The constructors compute
+// the rates in double and store them in T, while the long double reference
+// stores the double rates; the two objects have identical rates only if the
+// double rates are exactly representable in T (always for double; for float
+// only by construction). The library cannot be changed to inject rates, so the
+// parameters of p are used unchanged if they already have this property, and
+// otherwise replaced by the nearest ones that do: the float neighbours of
+// the rates of p are tried in the order 0, +1, -1, +2, ... and the first one
+// for which tau_plus and then lambda can be found is taken (the test asserts
+// that the rates stay within 1e-5 relative of those of p).
+struct MatchedParams {
+    double tau_plus, lambda;
+};
+
+template <typename T>
+MatchedParams matched_params(const Params& p) {
+    const double tp0 = p.nu * L::inv_cs2<double>() + 0.5;  // as TRT::from_viscosity
+    const double tm0 = p.lambda / (tp0 - 0.5) + 0.5;       // as TRT::from_tau
+    const double rp = 1.0 / tp0, rm = 1.0 / tm0;
+    if (static_cast<double>(static_cast<T>(rp)) == rp && static_cast<double>(static_cast<T>(rm)) == rm)
+        return {tp0, p.lambda};
+
+    auto neighbour = [](double r, int k) {
+        T x = static_cast<T>(r);
+        for (int i = 0; i < std::abs(k); ++i)
+            x = std::nextafter(x, k > 0 ? std::numeric_limits<T>::infinity()
+                                        : -std::numeric_limits<T>::infinity());
+        return static_cast<double>(x);
+    };
+    for (int kp = 0; kp < 64; ++kp) {
+        const int sp = (kp % 2 == 0) ? kp / 2 : -(kp + 1) / 2;
+        const double tp = tau_for_rate(neighbour(rp, sp));
+        if (tp == 0.0) continue;
+        for (int km = 0; km < 64; ++km) {
+            const int sm = (km % 2 == 0) ? km / 2 : -(km + 1) / 2;
+            const double rmt = neighbour(rm, sm);
+            const double tm = tau_for_rate(rmt);
+            if (tm == 0.0) continue;
+            const double lam0 = (tm - 0.5) * (tp - 0.5);
+            for (int j = -64; j <= 64; ++j) {
+                const double lam = step_ulps(lam0, j);
+                if (!(lam > 0.0)) continue;
+                if (1.0 / (lam / (tp - 0.5) + 0.5) == rmt) return {tp, lam};
+            }
+        }
+    }
+    throw std::runtime_error("matched_params: no parameters with rates exactly representable in T");
+}
+
+} // namespace
+
+TYPED_TEST(ForceTest, ForcedCollisionMatchesLongDoubleReference) {
+    using T = TypeParam;
+    const ld eps_t = kEps<T>;
+    const ld u_t = kU<T>;
+    const ld u_l = kULd;
+    int compared = 0;
+
+    for (const Params& p : {P1, P2})
+        for (const auto& fc : kF) {
+            ASSERT_NE(fc[0], 0.0);
+            ASSERT_NE(fc[1], 0.0);
+            const double fcd[2] = {fc[0], fc[1]};
+            const Force<T> force_t = Force<T>::create(fcd);
+            const MatchedParams mp = matched_params<T>(p);
+            const auto trt = lbm::TRT<T, Force<T>>::from_tau(mp.tau_plus, mp.lambda, force_t);
+            // Force of the reference: the T values, converted exactly.
+            const ld F[2] = {static_cast<ld>(force_t.F(0)), static_cast<ld>(force_t.F(1))};
+            const double Fd[2] = {static_cast<double>(force_t.F(0)), static_cast<double>(force_t.F(1))};
+            const Force<ld> force_l = Force<ld>::create(Fd);
+            ASSERT_EQ(force_l.F(0), F[0]);
+            ASSERT_EQ(force_l.F(1), F[1]);
+            const auto ref = lbm::TRT<ld, Force<ld>>::from_tau(mp.tau_plus, mp.lambda, force_l);
+
+            const ld wp = trt.omega_plus(), wm = trt.omega_minus();
+            // Preconditions: the reference has the rates of the T object
+            // exactly, they are in (0, 2) (so 0 < 1 - omega/2 < 1), distinct for
+            // P1 and equal for P2.
+            ASSERT_EQ(ref.omega_plus(), wp);
+            ASSERT_EQ(ref.omega_minus(), wm);
+            {
+                const auto nominal = lbm::TRT<double>::from_viscosity<L>(p.nu, p.lambda);
+                ASSERT_LE(std::abs(wp - nominal.omega_plus()), 1e-5L * nominal.omega_plus());
+                ASSERT_LE(std::abs(wm - nominal.omega_minus()), 1e-5L * nominal.omega_minus());
+            }
+            ASSERT_GT(wp, 0.0L);
+            ASSERT_LT(wp, 2.0L);
+            ASSERT_GT(wm, 0.0L);
+            ASSERT_LT(wm, 2.0L);
+            if (p.nu == P1.nu) {
+                ASSERT_NE(wp, wm);
+            } else {
+                ASSERT_EQ(wp, wm);
+            }
+            const ld cp = 1.0L - 0.5L * wp;
+            const auto plain = lbm::TRT<T>::template from_viscosity<L>(p.nu, p.lambda);
+
+            for (const State& st : low_mach_states()) {
+                T fT[L::Q];
+                perturbed_input<T>(st, fT);
+                ld f[L::Q];
+                ld S = 0;
+                for (int q = 0; q < L::Q; ++q) {
+                    f[q] = static_cast<ld>(fT[q]);
+                    S += std::abs(f[q]);
+                }
+
+                // Moments the reference computes (same code), the expansion
+                // point of the bounds.
+                ld drho, u[L::D];
+                lbm::moments_shifted_forced<L, ld>(f, F, drho, u);
+                const ld rho = 1.0L + drho;
+
+                const ld alpha_t = K_sum * eps_t * S;
+                const ld alpha_l = K_sum * kEpsLd * S;
+                // Precondition of forced_velocity_bound: d < rho.
+                ASSERT_LT(rho_error(alpha_t, u_t, rho), rho);
+                ASSERT_LT(rho_error(alpha_l, u_l, rho), rho);
+                ld beta_t[L::D], beta_l[L::D], uabs[L::D];
+                for (int d = 0; d < L::D; ++d) {
+                    beta_t[d] = forced_velocity_bound(alpha_t, u_t, rho, std::abs(u[d]));
+                    beta_l[d] = forced_velocity_bound(alpha_l, u_l, rho, std::abs(u[d]));
+                    uabs[d] = std::abs(u[d]) + beta_t[d];
+                }
+
+                ld E_T[L::Q], E_L[L::Q], N[L::Q];
+                for (int q = 0; q < L::Q; ++q) {
+                    const ld feq = lbm::equilibrium_shifted<L, ld>(q, drho, u);
+                    const ld sc = scale_e(q, drho, u);
+                    E_T[q] = eq_perturbation(q, drho, u, alpha_t, beta_t) + K_e * eps_t * sc;
+                    E_L[q] = eq_perturbation(q, drho, u, alpha_l, beta_l) + K_e * kEpsLd * sc;
+                    N[q] = std::abs(f[q]) + std::abs(feq) + E_T[q] + E_L[q];
+                }
+
+                T out_t[L::Q];
+                ld out_l[L::Q];
+                for (int q = 0; q < L::Q; ++q) {
+                    out_t[q] = fT[q];
+                    out_l[q] = f[q];
+                }
+                trt.template collide<L>(out_t);
+                ref.template collide<L>(out_l);
+
+                ld max_tol = 0;
+                for (int q = 0; q < L::Q; ++q) {
+                    const int o = L::opp(q);
+                    const ld Np = N[q] + N[o];
+                    const ld Wq = source_scale(q, uabs, F);
+                    const ld Mq = std::abs(f[q]) + 0.5L * (wp + wm) * Np + Wq;
+                    const ld o_t = static_cast<ld>(out_t[q]);
+
+                    const ld tol =
+                        0.5L * (wp + wm) * (E_T[q] + E_T[o] + E_L[q] + E_L[o]) +
+                        cp * (source_velocity_error(q, F, beta_t) + source_velocity_error(q, F, beta_l)) +
+                        ((K_src + K_w) * Wq + K_chain_hd * (Mq + Np)) * (u_t + u_l) +
+                        u_l * (std::abs(o_t) + std::abs(out_l[q]));
+                    const ld err = std::abs(o_t - out_l[q]);
+                    EXPECT_LE(err, tol) << "q = " << q << ", nu = " << p.nu << ", F = (" << fc[0]
+                                        << ", " << fc[1] << "), drho = " << st.drho << ", u = ("
+                                        << st.ux << ", " << st.uy << "), err = " << err
+                                        << ", tol = " << tol;
+                    max_tol = std::max(max_tol, tol);
+                    ++compared;
+                }
+                // Guard: the force changes the result by more than the bound, so
+                // the test can see an error in the forced terms.
+                T out_plain[L::Q];
+                for (int q = 0; q < L::Q; ++q) out_plain[q] = fT[q];
+                plain.template collide<L>(out_plain);
+                ld max_force = 0;
+                for (int q = 0; q < L::Q; ++q)
+                    max_force = std::max(max_force, std::abs(static_cast<ld>(out_t[q]) -
+                                                             static_cast<ld>(out_plain[q])));
+                EXPECT_GT(max_force, max_tol);
+            }
+        }
+    ASSERT_GT(compared, 0);
 }
 
 // f. Factory rejection names the component.
