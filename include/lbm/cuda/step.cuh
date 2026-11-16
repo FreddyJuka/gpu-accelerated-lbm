@@ -24,19 +24,22 @@ namespace lbm {
 // RTX 3050 Laptop: double nx = 4 runs 7.5x faster, nx = 16 2x, nx = 100 1.3x,
 // square grids unchanged. Coalescing is the same as with one row per block:
 // the SoA index is q * N + node, contiguous in node. Grid2D and the collision
-// policy are passed by value.
-template <typename L, typename T, typename Collision>
-__global__ void step_kernel(Grid2D<L> g, const NodeType* flags, const T* src, T* dst,
+// policy are passed by value. src and dst hold Storage values; the collision
+// runs in the policy's compute type (see pull_stream_collide and
+// lbm/storage.hpp).
+template <typename L, typename Storage, typename Collision>
+__global__ void step_kernel(Grid2D<L> g, const NodeType* flags, const Storage* src, Storage* dst,
                             Collision coll) {
     const int node = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (node >= g.num_nodes()) return;
     const int y = node / g.nx();
     const int x = node - y * g.nx();
-    pull_stream_collide<L, T>(g, flags, src, dst, coll, x, y);
+    pull_stream_collide<L, Storage>(g, flags, src, dst, coll, x, y);
 }
 
 // Launches one pull stream-collide step with halfway bounce-back from d_src to
-// d_dst (device pointers; d_flags holds one NodeType per node). Asynchronous:
+// d_dst (device pointers to Storage values; d_flags holds one NodeType per
+// node). The collision runs in the policy's compute type. Asynchronous:
 // no device synchronization is performed. Throws
 // std::invalid_argument for null pointers (including d_flags) or d_src == d_dst,
 // and std::runtime_error if the launch fails.
@@ -45,8 +48,8 @@ __global__ void step_kernel(Grid2D<L> g, const NodeType* flags, const T* src, T*
 // is one-dimensional with ceil(N / 128) blocks, N = nx * ny <= INT32_MAX / Q,
 // so at most ceil((2^31 - 1) / 128) = 2^24 blocks, far below the grid x limit
 // of 2^31 - 1. The launch does not depend on ny.
-template <typename L, typename T, typename Collision>
-void step_gpu(const Grid2D<L>& g, const NodeType* d_flags, const T* d_src, T* d_dst,
+template <typename L, typename Storage, typename Collision>
+void step_gpu(const Grid2D<L>& g, const NodeType* d_flags, const Storage* d_src, Storage* d_dst,
               const Collision& coll) {
     if (d_flags == nullptr) throw std::invalid_argument("step_gpu: flags is null");
     if (d_src == nullptr) throw std::invalid_argument("step_gpu: src is null");
@@ -59,7 +62,7 @@ void step_gpu(const Grid2D<L>& g, const NodeType* d_flags, const T* d_src, T* d_
     constexpr int block_x = 128;
     const dim3 block(block_x, 1, 1);
     const dim3 grid(static_cast<unsigned>((g.num_nodes() + block_x - 1) / block_x), 1, 1);
-    step_kernel<L, T, Collision><<<grid, block>>>(g, d_flags, d_src, d_dst, coll);
+    step_kernel<L, Storage, Collision><<<grid, block>>>(g, d_flags, d_src, d_dst, coll);
     LBM_CUDA_CHECK(cudaGetLastError());
 }
 

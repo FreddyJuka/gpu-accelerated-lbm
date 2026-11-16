@@ -1,5 +1,6 @@
-// Compile-only check: the lattice, grid, equilibrium, moments, TRT (unforced and forced) and pull step code must
-// compile in device code for float and double without warnings. The kernels
+// Compile-only check: the lattice, grid, equilibrium, moments, TRT (unforced and forced), storage conversion and
+// pull step code must compile in device code for float and double (and for
+// float storage with double compute) without warnings. The kernels
 // are never launched; results are written to global memory so that the code
 // is not optimized away and the generated SASS can be inspected.
 
@@ -11,6 +12,7 @@
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
 #include "lbm/propagation/ab_pull.hpp"
+#include "lbm/storage.hpp"
 
 namespace {
 
@@ -102,6 +104,34 @@ __global__ void check_pull_step(lbm::Grid2D<L> grid, const lbm::NodeType* flags,
     lbm::pull_stream_collide<L, T>(grid, flags, src, dst, trt, x, y);
 }
 
+// Storage conversion on its own: load, then store.
+template <typename Storage, typename Compute>
+__global__ void check_storage_conversion(const Storage* in, Compute* loaded, Storage* out) {
+    using Conversion = lbm::StorageConversion<Storage, Compute>;
+    const int i = static_cast<int>(threadIdx.x);
+    const Compute c = Conversion::load(in[i]);
+    loaded[i] = c;
+    out[i] = Conversion::store(c);
+}
+
+// Pull step with distinct storage and compute types (unforced and forced).
+template <typename Storage, typename Compute>
+__global__ void check_pull_step_mixed(lbm::Grid2D<L> grid, const lbm::NodeType* flags,
+                                      lbm::TRT<Compute> trt, const Storage* src, Storage* dst) {
+    const int x = static_cast<int>(threadIdx.x);
+    const int y = static_cast<int>(threadIdx.y);
+    lbm::pull_stream_collide<L, Storage>(grid, flags, src, dst, trt, x, y);
+}
+
+template <typename Storage, typename Compute>
+__global__ void check_pull_step_mixed_forced(lbm::Grid2D<L> grid, const lbm::NodeType* flags,
+                                             lbm::TRT<Compute, lbm::UniformForce<Compute, L::D>> trt,
+                                             const Storage* src, Storage* dst) {
+    const int x = static_cast<int>(threadIdx.x);
+    const int y = static_cast<int>(threadIdx.y);
+    lbm::pull_stream_collide<L, Storage>(grid, flags, src, dst, trt, x, y);
+}
+
 template __global__ void check_equilibrium<float>(const float*, const float*, float*);
 template __global__ void check_equilibrium<double>(const double*, const double*, double*);
 template __global__ void check_moments<float>(const float*, float*, float*);
@@ -123,5 +153,14 @@ template __global__ void check_pull_step_forced<double>(
     const double*, double*);
 template __global__ void check_grid<float>(lbm::Grid2D<L>, const float*, float*);
 template __global__ void check_grid<double>(lbm::Grid2D<L>, const double*, double*);
+template __global__ void check_storage_conversion<float, float>(const float*, float*, float*);
+template __global__ void check_storage_conversion<double, double>(const double*, double*, double*);
+template __global__ void check_storage_conversion<float, double>(const float*, double*, float*);
+template __global__ void check_pull_step_mixed<float, double>(lbm::Grid2D<L>, const lbm::NodeType*,
+                                                              lbm::TRT<double>, const float*,
+                                                              float*);
+template __global__ void check_pull_step_mixed_forced<float, double>(
+    lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<double, lbm::UniformForce<double, 2>>,
+    const float*, float*);
 
 } // namespace

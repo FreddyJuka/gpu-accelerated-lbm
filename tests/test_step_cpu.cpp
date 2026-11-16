@@ -16,13 +16,16 @@
 
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "lbm/collision/trt.hpp"
 #include "lbm/cpu/step.hpp"
 #include "lbm/equilibrium.hpp"
+#include "lbm/force.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "lbm/storage.hpp"
 #include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
@@ -181,4 +184,103 @@ TYPED_TEST(StepCpu, RejectsInvalidArguments) {
     EXPECT_THROW(step(a.data(), nullptr), std::invalid_argument);
     EXPECT_THROW(step(nullptr, nullptr), std::invalid_argument);
     EXPECT_NO_THROW(step(a.data(), b.data()));
+}
+
+// ---------------------------------------------------------------------------
+// f. Mixed precision: float storage, double compute.
+// ---------------------------------------------------------------------------
+// The step is, for every fluid node and population, bitwise equal to
+//
+//   gather the float values (plain pull, or the node's own opposite
+//   population when the source node is a wall)
+//   -> widen each to double                      (load, exact)
+//   -> TRT<double>::collide                      (same code path)
+//   -> convert each result to float              (store, one IEEE rounding)
+//
+// done by hand here with static_cast, not through StorageConversion. The
+// gather uses explicit modular arithmetic and reads the flags directly. Wall
+// nodes keep the sentinel.
+//
+// Guard: the same gathered values collided in float (trt_float, same
+// parameters) must differ from the step's output in at least one population,
+// so the comparison does distinguish double compute from float compute.
+namespace {
+
+template <typename TrtDouble, typename TrtFloat>
+void check_mixed_composition(const TrtDouble& trt, const TrtFloat& trt_float,
+                             const std::vector<lbm::NodeType>& flags) {
+    static_assert(std::is_same_v<lbm::collision_compute_t<TrtDouble, float>, double>);
+    static_assert(std::is_same_v<lbm::collision_compute_t<TrtFloat, float>, float>);
+    const Grid g(NX, NY);
+    const float sentinel = -12345.0f;
+    const std::vector<float> src = nonuniform_field<float>(g);
+    std::vector<float> dst(src.size(), sentinel);
+    lbm::step_cpu<L, float>(g, flags.data(), src.data(), dst.data(), trt);
+
+    auto wall = [&](int x, int y) {
+        return flags[static_cast<std::size_t>(g.node(mod(x, NX), mod(y, NY)))] == lbm::NodeType::Wall;
+    };
+
+    int fluid_nodes = 0;
+    int differs_from_float_compute = 0;
+    for (int y = 0; y < NY; ++y)
+        for (int x = 0; x < NX; ++x) {
+            if (wall(x, y)) {
+                for (int q = 0; q < L::Q; ++q)
+                    ASSERT_EQ(dst[static_cast<std::size_t>(g.idx(q, x, y))], sentinel)
+                        << "wall node written: q=" << q << " x=" << x << " y=" << y;
+                continue;
+            }
+            ++fluid_nodes;
+
+            float s[L::Q];
+            for (int q = 0; q < L::Q; ++q) {
+                const int xs = x - L::c(q, 0);
+                const int ys = y - L::c(q, 1);
+                s[q] = wall(xs, ys) ? src[static_cast<std::size_t>(g.idx(L::opp(q), x, y))]
+                                    : src[static_cast<std::size_t>(pull_src_index(g, q, x, y))];
+            }
+
+            double f[L::Q];
+            for (int q = 0; q < L::Q; ++q) f[q] = static_cast<double>(s[q]);
+            trt.template collide<L>(f);
+
+            float f_single[L::Q];
+            for (int q = 0; q < L::Q; ++q) f_single[q] = s[q];
+            trt_float.template collide<L>(f_single);
+
+            for (int q = 0; q < L::Q; ++q) {
+                const float got = dst[static_cast<std::size_t>(g.idx(q, x, y))];
+                ASSERT_EQ(got, static_cast<float>(f[q])) << "q=" << q << " x=" << x << " y=" << y;
+                if (got != f_single[q]) ++differs_from_float_compute;
+            }
+        }
+    EXPECT_GT(fluid_nodes, 0);
+    EXPECT_GT(differs_from_float_compute, 0);
+}
+
+std::vector<std::vector<lbm::NodeType>> mixed_flag_sets() {
+    const Grid g(NX, NY);
+    return {all_fluid(g), make_flags(g, Geometry::Channel), make_flags(g, Geometry::SingleWall)};
+}
+
+} // namespace
+
+TEST(StepCpuMixed, CompositionFloatStorageDoubleCompute) {
+    const auto trt = lbm::TRT<double>::from_viscosity<L>(0.01, 3.0 / 16.0);
+    const auto trt_float = lbm::TRT<float>::from_viscosity<L>(0.01, 3.0 / 16.0);
+    ASSERT_NE(trt.omega_plus(), trt.omega_minus());
+    for (const auto& flags : mixed_flag_sets()) check_mixed_composition(trt, trt_float, flags);
+}
+
+// Both force components nonzero, so the symmetric and the antisymmetric source
+// are both active.
+TEST(StepCpuMixed, CompositionFloatStorageDoubleComputeForced) {
+    const double F[2] = {3e-5, -7e-5};
+    const auto trt = lbm::TRT<double, lbm::UniformForce<double, 2>>::from_viscosity<L>(
+        0.01, 3.0 / 16.0, lbm::UniformForce<double, 2>::create(F));
+    const auto trt_float = lbm::TRT<float, lbm::UniformForce<float, 2>>::from_viscosity<L>(
+        0.01, 3.0 / 16.0, lbm::UniformForce<float, 2>::create(F));
+    ASSERT_NE(trt.omega_plus(), trt.omega_minus());
+    for (const auto& flags : mixed_flag_sets()) check_mixed_composition(trt, trt_float, flags);
 }

@@ -58,6 +58,10 @@ class TRT : private detail::TrtForceStorage<Force> {
     static constexpr bool forced = !std::is_same_v<Force, NoForce>;
 
 public:
+    // Type of the populations collide works on. The step functions read it to
+    // select the storage conversion (see lbm/storage.hpp).
+    using compute_type = T;
+
     // Host-only named constructors, the only way to obtain a TRT. Parameters are computed in double and the
     // resulting rates are stored as T. They throw std::invalid_argument for
     // nu <= 0, tau_plus <= 1/2, lambda <= 0, non-finite input, or a rate that

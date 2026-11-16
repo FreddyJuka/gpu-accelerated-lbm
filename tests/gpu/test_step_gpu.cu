@@ -59,7 +59,8 @@ TYPED_TEST_SUITE(StepGpu, PrecisionTypes);
 } // namespace
 
 // Bodies shared by the unforced and the forced collision. Trt is
-// TRT<T> or TRT<T, UniformForce<T, 2>>.
+// TRT<T> or TRT<T, UniformForce<T, 2>>; for the mixed-precision tests T is
+// the storage type (float) and Trt computes in double.
 namespace {
 
 template <typename T, typename Trt>
@@ -154,6 +155,30 @@ TYPED_TEST(StepGpu, HundredStepsMatchCpu) {
 // b2. The same with the forced collision.
 TYPED_TEST(StepGpu, HundredStepsForcedMatchesCpu) {
     check_hundred_steps<TypeParam>(forced_trt<TypeParam>(), "forced ");
+}
+
+// b3. Mixed precision: float storage (host vectors and device buffers of
+// float) with double compute (TRT<double>). The shared bodies take the storage
+// type as T and the collision as given, so the comparison is the same as
+// above: bitwise, 7 x 5 and 200 x 37, channel and single wall. Load (float ->
+// double, exact) and store (double -> float, one IEEE rounding to nearest) are
+// single operations on both sides.
+TEST(StepGpuMixed, OneStepMatchesCpu) {
+    check_one_step<float>(lbm::TRT<double>::from_viscosity<L>(0.01, 3.0 / 16.0),
+                          "mixed unforced ");
+}
+
+TEST(StepGpuMixed, OneStepForcedMatchesCpu) {
+    check_one_step<float>(forced_trt<double>(), "mixed forced ");
+}
+
+TEST(StepGpuMixed, HundredStepsMatchCpu) {
+    check_hundred_steps<float>(lbm::TRT<double>::from_viscosity<L>(0.01, 3.0 / 16.0),
+                               "mixed unforced ");
+}
+
+TEST(StepGpuMixed, HundredStepsForcedMatchesCpu) {
+    check_hundred_steps<float>(forced_trt<double>(), "mixed forced ");
 }
 
 // c. Launcher rejection.

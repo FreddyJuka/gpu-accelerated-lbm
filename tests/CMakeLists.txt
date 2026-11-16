@@ -8,7 +8,8 @@ add_executable(lbm_tests
   test_step_cpu.cpp
   test_bounce_back.cpp
   test_force.cpp
-  test_poiseuille.cpp)
+  test_poiseuille.cpp
+  test_storage.cpp)
 
 # The exact and bitwise tests assume IEEE arithmetic without contraction of
 # a*b+c into FMA on the host (see support/fp_environment.hpp). Contraction is
