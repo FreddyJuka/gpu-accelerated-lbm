@@ -31,8 +31,9 @@ namespace {
 struct GridSize {
     int nx, ny;
 };
-// 7 x 5: single partial block. 200 x 37: two blocks along x, the second one
-// partial (72 of 128 threads active).
+// 7 x 5 = 35 nodes: a single partial block (35 of 128 threads active).
+// 200 x 37 = 7400 nodes: 57 full blocks of 128 (7296 nodes) plus one partial
+// block of 104 threads; blocks straddle row boundaries.
 const GridSize kSizes[] = {{7, 5}, {200, 37}};
 
 std::string label(const GridSize& s, Geometry geo) {
@@ -174,31 +175,38 @@ TYPED_TEST(StepGpu, LauncherRejectsInvalidArguments) {
     EXPECT_THROW(step(nullptr, a.data(), b.data()), std::invalid_argument);
 }
 
-// c2. ny above the device's grid y limit is a valid Grid2D but is rejected by
-// the launcher before anything is launched (the buffers are never accessed).
-TYPED_TEST(StepGpu, LauncherRejectsNyAboveGridLimit) {
+// c2. Tall, narrow grids with ny above the maximum grid y dimension (65535)
+// of the former two-dimensional launch run on the GPU and match the CPU
+// bitwise after a few steps.
+TYPED_TEST(StepGpu, TallNarrowGridsMatchCpu) {
     using T = TypeParam;
-    int device = 0;
-    LBM_CUDA_CHECK(cudaGetDevice(&device));
-    int max_grid_y = 0;
-    LBM_CUDA_CHECK(cudaDeviceGetAttribute(&max_grid_y, cudaDevAttrMaxGridDimY, device));
-    ASSERT_GT(max_grid_y, 0);
-
-    const int ny = max_grid_y + 1;
-    ASSERT_NO_THROW(Grid(1, ny));
-    const Grid g(1, ny);
     const auto trt = lbm::TRT<T>::template from_viscosity<L>(0.01, 3.0 / 16.0);
-    lbm::DeviceBuffer<T> a(1), b(1);
-    lbm::DeviceBuffer<lbm::NodeType> flags(1);
+    for (const GridSize s : {GridSize{1, 70000}, GridSize{3, 70000}})
+        for (const Geometry geo : kGeometries) {
+            ASSERT_GT(s.ny, 65535);
+            const Grid g(s.nx, s.ny);
+            const std::vector<T> init = nonuniform_field<T>(g);
+            const std::vector<lbm::NodeType> flags = make_flags(g, geo);
+            const int n = static_cast<int>(init.size());
 
-    try {
-        lbm::step_gpu<L, T>(g, flags.data(), a.data(), b.data(), trt);
-        FAIL() << "expected std::invalid_argument";
-    } catch (const std::invalid_argument& e) {
-        const std::string msg = e.what();
-        EXPECT_NE(msg.find("ny"), std::string::npos) << msg;
-        EXPECT_NE(msg.find(std::to_string(ny)), std::string::npos) << msg;
-    }
+            std::vector<T> ca = init, cb = init;
+            lbm::DeviceBuffer<T> da(n), db(n);
+            lbm::DeviceBuffer<lbm::NodeType> d_flags(g.num_nodes());
+            d_flags.copy_from_host(flags.data(), g.num_nodes());
+            da.copy_from_host(init.data(), n);
+            db.copy_from_host(init.data(), n);
+
+            for (int step = 0; step < 5; ++step) {
+                lbm::step_cpu<L, T>(g, flags.data(), ca.data(), cb.data(), trt);
+                std::swap(ca, cb);
+                lbm::step_gpu<L, T>(g, d_flags.data(), da.data(), db.data(), trt);
+                std::swap(da, db);
+            }
+            LBM_CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<T> gpu(init.size());
+            da.copy_to_host(gpu.data(), n);
+            expect_equal(gpu, ca, label(s, geo) + " 5 steps");
+        }
 }
 
 // d. DeviceBuffer.
