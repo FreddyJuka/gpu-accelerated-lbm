@@ -1,6 +1,6 @@
 // Performance measurement of the GPU stream-collide step (lbm::step_gpu).
 //
-// For every selected combination of precision (float, double), grid size,
+// For every selected combination of storage/compute configuration, grid size,
 // geometry (all-fluid periodic domain, channel with walls at y = 0 and
 // y = ny - 1) and collision (unforced TRT, forced TRT with Guo source) the app
 // runs a warm-up, then `reps` timed repetitions of `steps` steps each, timed
@@ -12,10 +12,17 @@
 //
 // bytes_per_node_update is the minimum DRAM traffic of one node update in the
 // two-buffer pull scheme: Q populations read + Q populations written, each of
-// sizeof(T) bytes, plus one flag byte (each node's flag has to come from DRAM
-// at least once per step; the Q neighbour flag reads of a node hit lines that
-// are already in cache and are not counted). So
-//   bytes_per_node_update = 2 * Q * sizeof(T) + 1.
+// sizeof(Storage) bytes, plus one flag byte (each node's flag has to come from
+// DRAM at least once per step; the Q neighbour flag reads of a node hit lines
+// that are already in cache and are not counted). So
+//   bytes_per_node_update = 2 * Q * sizeof(Storage) + 1
+// (73 for float storage, 145 for double, 37 for the 16-bit lbm::P16).
+//
+// Configurations (storage type / compute type):
+//   float   float  / float
+//   double  double / double
+//   p16     lbm::P16 (16 bit) / float
+//   mixed   float  / double
 //
 // Two references for the bandwidth:
 //   peak  = memory clock [Hz] * 2 (double data rate) * bus width [bit] / 8,
@@ -35,7 +42,15 @@
 //                     two population buffers plus flags fit in
 //                     --mem-fraction of the free device memory.
 //   --mem-fraction F  fraction of free device memory a case may use (0.75).
-//   --precision P     float | double | both (both).
+//   --precision P     float | double | both (both). Cases are run configuration
+//                     by configuration (all sizes of float, then double).
+//   --storage LIST    comma separated list of float, double, p16, mixed, or
+//                     "all". Replaces --precision. Cases are run size by size
+//                     with the configurations interleaved in the order given,
+//                     so that configurations of one size see the same clocks.
+//                     With --sizes auto the sizes are those that fit for at
+//                     least one selected configuration; a configuration is
+//                     skipped at the sizes it does not fit.
 //   --geometry G      periodic | channel | both (both).
 //   --forcing F       off | on | both (both).
 //   --steps N|auto    steps per timed repetition (auto: the smallest number of
@@ -61,6 +76,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -71,6 +87,7 @@
 #include "lbm/force.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "lbm/storage.hpp"
 
 namespace {
 
@@ -89,6 +106,7 @@ struct Options {
     std::vector<Size> sizes;  // empty: auto
     double mem_fraction = 0.75;
     bool do_float = true, do_double = true;
+    std::vector<std::string> storage;  // empty: use do_float / do_double (--precision)
     bool do_periodic = true, do_channel = true;
     bool do_unforced = true, do_forced = true;
     int steps = 0;  // 0: auto
@@ -110,7 +128,8 @@ struct Options {
     std::fprintf(stderr, "lbm_benchmark: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: lbm_benchmark [--sizes LIST|auto] [--mem-fraction F]\n"
-                 "       [--precision float|double|both] [--geometry periodic|channel|both]\n"
+                 "       [--precision float|double|both] [--storage float,double,p16,mixed|all]\n"
+                 "       [--geometry periodic|channel|both]\n"
                  "       [--forcing off|on|both] [--steps N|auto] [--rep-ms X] [--reps R] [--warmup N]\n"
                  "       [--nu X] [--lambda X] [--force X] [--copy-mib M] [--csv FILE] [--no-smi]\n");
     std::exit(2);
@@ -192,6 +211,20 @@ Options parse_options(int argc, char** argv) {
             if (o.mem_fraction <= 0.0 || o.mem_fraction > 1.0) usage_error("mem-fraction must be in (0, 1]");
         } else if (key == "--precision") {
             choose(value, "float", "double", o.do_float, o.do_double, "precision");
+        } else if (key == "--storage") {
+            o.storage.clear();
+            const std::string list = (value == "all") ? "float,double,p16,mixed" : value;
+            std::size_t pos = 0;
+            while (pos <= list.size()) {
+                const std::size_t comma = list.find(',', pos);
+                const std::string item =
+                    list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (item != "float" && item != "double" && item != "p16" && item != "mixed")
+                    usage_error("invalid storage configuration '" + item + "'");
+                o.storage.push_back(item);
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
         } else if (key == "--geometry") {
             choose(value, "periodic", "channel", o.do_periodic, o.do_channel, "geometry");
         } else if (key == "--forcing") {
@@ -403,7 +436,7 @@ CopyResult measure_copy(const Options& opt) {
 // Step benchmark
 // ---------------------------------------------------------------------------
 struct CaseResult {
-    const char* precision;
+    const char* precision;  // configuration name: float, double, p16, mixed
     int nx, ny;
     Geometry geometry;
     bool forced;
@@ -414,16 +447,17 @@ struct CaseResult {
     double frac_peak, frac_copy;
 };
 
-template <typename T>
+// Storage is the element type of the population buffers.
+template <typename Storage>
 constexpr std::size_t bytes_per_node_update() {
-    return 2 * static_cast<std::size_t>(L::Q) * sizeof(T) + 1;
+    return 2 * static_cast<std::size_t>(L::Q) * sizeof(Storage) + 1;
 }
 
 // Two population buffers plus the flag array.
-template <typename T>
+template <typename Storage>
 std::size_t case_bytes(const Size& s) {
     const std::size_t nodes = static_cast<std::size_t>(s.nx) * static_cast<std::size_t>(s.ny);
-    return nodes * (2 * static_cast<std::size_t>(L::Q) * sizeof(T) + 1);
+    return nodes * (2 * static_cast<std::size_t>(L::Q) * sizeof(Storage) + 1);
 }
 
 std::vector<lbm::NodeType> make_flags(const Grid& g, Geometry geo) {
@@ -436,14 +470,16 @@ std::vector<lbm::NodeType> make_flags(const Grid& g, Geometry geo) {
     return flags;
 }
 
-template <typename T, typename Collision>
-CaseResult run_case(const Grid& g, Geometry geo, bool forced, const Collision& coll, const Options& opt,
-                    const DeviceInfo& dev, const CopyResult& copy) {
+// The buffers are zero-initialised: the rest state in every storage type (the
+// all-zero lbm::P16 pattern is +0).
+template <typename Storage, typename Collision>
+CaseResult run_case(const char* config, const Grid& g, Geometry geo, bool forced, const Collision& coll,
+                    const Options& opt, const DeviceInfo& dev, const CopyResult& copy) {
     const int n = L::Q * g.num_nodes();
-    lbm::DeviceBuffer<T> da(n), db(n);
+    lbm::DeviceBuffer<Storage> da(n), db(n);
     lbm::DeviceBuffer<lbm::NodeType> d_flags(g.num_nodes());
-    LBM_CUDA_CHECK(cudaMemset(da.data(), 0, static_cast<std::size_t>(n) * sizeof(T)));
-    LBM_CUDA_CHECK(cudaMemset(db.data(), 0, static_cast<std::size_t>(n) * sizeof(T)));
+    LBM_CUDA_CHECK(cudaMemset(da.data(), 0, static_cast<std::size_t>(n) * sizeof(Storage)));
+    LBM_CUDA_CHECK(cudaMemset(db.data(), 0, static_cast<std::size_t>(n) * sizeof(Storage)));
     const std::vector<lbm::NodeType> flags = make_flags(g, geo);
     d_flags.copy_from_host(flags.data(), g.num_nodes());
 
@@ -451,7 +487,7 @@ CaseResult run_case(const Grid& g, Geometry geo, bool forced, const Collision& c
     LBM_CUDA_CHECK(cudaDeviceSynchronize());
     timer.start();
     for (int i = 0; i < opt.warmup; ++i) {
-        lbm::step_gpu<L, T>(g, d_flags.data(), da.data(), db.data(), coll);
+        lbm::step_gpu<L, Storage>(g, d_flags.data(), da.data(), db.data(), coll);
         std::swap(da, db);
     }
     const double warmup_ms_per_step = timer.stop_ms() / opt.warmup;
@@ -468,14 +504,14 @@ CaseResult run_case(const Grid& g, Geometry geo, bool forced, const Collision& c
     for (int rep = 0; rep < opt.reps; ++rep) {
         timer.start();
         for (int i = 0; i < steps; ++i) {
-            lbm::step_gpu<L, T>(g, d_flags.data(), da.data(), db.data(), coll);
+            lbm::step_gpu<L, Storage>(g, d_flags.data(), da.data(), db.data(), coll);
             std::swap(da, db);
         }
         ms_per_step.push_back(timer.stop_ms() / steps);
     }
 
     CaseResult r;
-    r.precision = sizeof(T) == 4 ? "float" : "double";
+    r.precision = config;
     r.nx = g.nx();
     r.ny = g.ny();
     r.geometry = geo;
@@ -486,7 +522,7 @@ CaseResult run_case(const Grid& g, Geometry geo, bool forced, const Collision& c
     const double nodes = static_cast<double>(g.num_nodes());
     const double s_per_step = r.ms_per_step.median * 1e-3;
     r.mlups = nodes / s_per_step / 1e6;
-    r.bytes_per_s = nodes * static_cast<double>(bytes_per_node_update<T>()) / s_per_step;
+    r.bytes_per_s = nodes * static_cast<double>(bytes_per_node_update<Storage>()) / s_per_step;
     r.frac_peak = r.bytes_per_s / dev.peak_bytes_per_s();
     r.frac_copy = r.bytes_per_s / copy.kernel_bytes_per_s;
     return r;
@@ -509,15 +545,21 @@ void write_csv_row(std::FILE* fp, const CaseResult& r) {
     std::fflush(fp);
 }
 
-template <typename T>
-std::vector<Size> sizes_for(const Options& opt, const DeviceInfo& dev) {
-    const std::size_t budget = static_cast<std::size_t>(opt.mem_fraction * static_cast<double>(dev.free_bytes));
+std::size_t memory_budget(const Options& opt, const DeviceInfo& dev) {
+    return static_cast<std::size_t>(opt.mem_fraction * static_cast<double>(dev.free_bytes));
+}
+
+// Sizes of one configuration: the explicit list without the sizes that do not
+// fit (reported), or, with --sizes auto, 128, 256, ... while they fit.
+template <typename Storage>
+std::vector<Size> sizes_for(const char* config, const Options& opt, const DeviceInfo& dev) {
+    const std::size_t budget = memory_budget(opt, dev);
     std::vector<Size> sizes;
     if (!opt.sizes.empty()) {
         for (const Size& s : opt.sizes) {
-            if (case_bytes<T>(s) > budget)
-                std::printf("skip %s %dx%d: needs %.0f MiB, budget %.0f MiB\n", sizeof(T) == 4 ? "float" : "double",
-                            s.nx, s.ny, case_bytes<T>(s) / 1048576.0, budget / 1048576.0);
+            if (case_bytes<Storage>(s) > budget)
+                std::printf("skip %s %dx%d: needs %.0f MiB, budget %.0f MiB\n", config, s.nx, s.ny,
+                            case_bytes<Storage>(s) / 1048576.0, budget / 1048576.0);
             else
                 sizes.push_back(s);
         }
@@ -525,7 +567,7 @@ std::vector<Size> sizes_for(const Options& opt, const DeviceInfo& dev) {
     }
     for (int n = 128; n <= 1 << 20; n *= 2) {
         const Size s{n, n};
-        if (case_bytes<T>(s) > budget) break;
+        if (case_bytes<Storage>(s) > budget) break;
         try {
             Grid probe(s.nx, s.ny);
         } catch (const std::invalid_argument&) {
@@ -536,39 +578,97 @@ std::vector<Size> sizes_for(const Options& opt, const DeviceInfo& dev) {
     return sizes;
 }
 
-template <typename T>
-void run_precision(const Options& opt, const DeviceInfo& dev, const CopyResult& copy, std::FILE* csv) {
-    using Force = lbm::UniformForce<T, L::D>;
-    const auto unforced = lbm::TRT<T>::template from_viscosity<L>(opt.nu, opt.lambda);
+// All cases (geometry, forcing) of one configuration at one size.
+template <typename Storage, typename Compute>
+void run_size(const char* config, const Size& s, const Options& opt, const DeviceInfo& dev,
+              const CopyResult& copy, std::FILE* csv) {
+    using Force = lbm::UniformForce<Compute, L::D>;
+    const auto unforced = lbm::TRT<Compute>::template from_viscosity<L>(opt.nu, opt.lambda);
     const double fc[L::D] = {opt.force_x, 0.0};
     const auto forced =
-        lbm::TRT<T, Force>::template from_viscosity<L>(opt.nu, opt.lambda, Force::create(fc));
+        lbm::TRT<Compute, Force>::template from_viscosity<L>(opt.nu, opt.lambda, Force::create(fc));
 
-    const std::vector<Size> sizes = sizes_for<T>(opt, dev);
-    std::printf("%s: bytes per node update = 2 * %d * %zu + 1 = %zu; %zu case size(s)\n",
-                sizeof(T) == 4 ? "float" : "double", L::Q, sizeof(T), bytes_per_node_update<T>(), sizes.size());
     std::vector<Geometry> geos;
     if (opt.do_periodic) geos.push_back(Geometry::Periodic);
     if (opt.do_channel) geos.push_back(Geometry::Channel);
 
-    for (const Size& s : sizes) {
-        Grid g(s.nx, s.ny);
-        for (const Geometry geo : geos) {
-            if (opt.do_unforced) {
-                const CaseResult r = run_case<T>(g, geo, false, unforced, opt, dev, copy);
-                print_case(r);
-                write_csv_row(csv, r);
-            }
-            if (opt.do_forced) {
-                const CaseResult r = run_case<T>(g, geo, true, forced, opt, dev, copy);
-                print_case(r);
-                write_csv_row(csv, r);
-            }
+    Grid g(s.nx, s.ny);
+    for (const Geometry geo : geos) {
+        if (opt.do_unforced) {
+            const CaseResult r = run_case<Storage>(config, g, geo, false, unforced, opt, dev, copy);
+            print_case(r);
+            write_csv_row(csv, r);
         }
-        sample_smi(opt.smi, (std::string(sizeof(T) == 4 ? "float " : "double ") + std::to_string(s.nx) + "x" +
-                             std::to_string(s.ny))
-                                .c_str());
+        if (opt.do_forced) {
+            const CaseResult r = run_case<Storage>(config, g, geo, true, forced, opt, dev, copy);
+            print_case(r);
+            write_csv_row(csv, r);
+        }
     }
+    sample_smi(opt.smi, (std::string(config) + " " + std::to_string(s.nx) + "x" + std::to_string(s.ny)).c_str());
+}
+
+template <typename Storage>
+void print_config(const char* config, std::size_t num_sizes) {
+    std::printf("%s: bytes per node update = 2 * %d * %zu + 1 = %zu; %zu case size(s)\n", config, L::Q,
+                sizeof(Storage), bytes_per_node_update<Storage>(), num_sizes);
+}
+
+// One configuration, all its sizes (the order of --precision).
+template <typename Storage, typename Compute>
+void run_config(const char* config, const Options& opt, const DeviceInfo& dev, const CopyResult& copy,
+                std::FILE* csv) {
+    const std::vector<Size> sizes = sizes_for<Storage>(config, opt, dev);
+    print_config<Storage>(config, sizes.size());
+    for (const Size& s : sizes) run_size<Storage, Compute>(config, s, opt, dev, copy, csv);
+}
+
+// Dispatch of a configuration name to its storage and compute types.
+template <typename Fn>
+void with_config(const std::string& config, Fn&& fn) {
+    if (config == "float")
+        fn(static_cast<float*>(nullptr), static_cast<float*>(nullptr));
+    else if (config == "double")
+        fn(static_cast<double*>(nullptr), static_cast<double*>(nullptr));
+    else if (config == "p16")
+        fn(static_cast<lbm::P16*>(nullptr), static_cast<float*>(nullptr));
+    else if (config == "mixed")
+        fn(static_cast<float*>(nullptr), static_cast<double*>(nullptr));
+    else
+        throw std::logic_error("unknown configuration " + config);
+}
+
+// --storage: size by size, the configurations interleaved in the given order.
+void run_interleaved(const Options& opt, const DeviceInfo& dev, const CopyResult& copy, std::FILE* csv) {
+    // Sizes of each configuration (prints the skipped ones), and their union in
+    // order of first appearance.
+    std::vector<std::vector<Size>> per_config;
+    std::vector<Size> all;
+    for (const std::string& config : opt.storage)
+        with_config(config, [&](auto* storage, auto*) {
+            using Storage = std::remove_pointer_t<decltype(storage)>;
+            per_config.push_back(sizes_for<Storage>(config.c_str(), opt, dev));
+            print_config<Storage>(config.c_str(), per_config.back().size());
+            for (const Size& s : per_config.back()) {
+                const bool known = std::any_of(all.begin(), all.end(),
+                                               [&](const Size& a) { return a.nx == s.nx && a.ny == s.ny; });
+                if (!known) all.push_back(s);
+            }
+        });
+    if (opt.sizes.empty())
+        std::sort(all.begin(), all.end(), [](const Size& a, const Size& b) { return a.nx < b.nx; });
+
+    for (const Size& s : all)
+        for (std::size_t c = 0; c < opt.storage.size(); ++c) {
+            const bool fits = std::any_of(per_config[c].begin(), per_config[c].end(),
+                                          [&](const Size& a) { return a.nx == s.nx && a.ny == s.ny; });
+            if (!fits) continue;
+            with_config(opt.storage[c], [&](auto* storage, auto* compute) {
+                using Storage = std::remove_pointer_t<decltype(storage)>;
+                using Compute = std::remove_pointer_t<decltype(compute)>;
+                run_size<Storage, Compute>(opt.storage[c].c_str(), s, opt, dev, copy, csv);
+            });
+        }
 }
 
 }  // namespace
@@ -602,8 +702,12 @@ int main(int argc, char** argv) {
                               "ms_per_step_max,mlups,gb_per_s,frac_peak,frac_copy\n");
         }
 
-        if (opt.do_float) run_precision<float>(opt, dev, copy, csv);
-        if (opt.do_double) run_precision<double>(opt, dev, copy, csv);
+        if (!opt.storage.empty()) {
+            run_interleaved(opt, dev, copy, csv);
+        } else {
+            if (opt.do_float) run_config<float, float>("float", opt, dev, copy, csv);
+            if (opt.do_double) run_config<double, double>("double", opt, dev, copy, csv);
+        }
 
         if (csv != nullptr) std::fclose(csv);
         return 0;

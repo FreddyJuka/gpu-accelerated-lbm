@@ -8,12 +8,14 @@
 // `using namespace lbmtest;`; it does not define its own L or Grid.
 
 #include <cstddef>
+#include <type_traits>
 #include <vector>
 
 #include "lbm/config.hpp"
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "lbm/storage.hpp"
 
 namespace lbmtest {
 
@@ -119,6 +121,31 @@ std::vector<T> nonuniform_field(const Grid& g) {
         }
     return f;
 }
+
+// nonuniform_field as it lies in a buffer of Storage. For a floating-point
+// Storage this is nonuniform_field<Storage> itself; for a storage format with
+// a compute type of its own (P16: float) it is the field in the compute type,
+// converted with the store of the format, i.e. a field of representable values.
+template <typename Storage>
+std::vector<Storage> nonuniform_stored_field(const Grid& g) {
+    if constexpr (std::is_floating_point_v<Storage>) {
+        return nonuniform_field<Storage>(g);
+    } else {
+        const std::vector<float> f = nonuniform_field<float>(g);
+        std::vector<Storage> s(f.size());
+        for (std::size_t i = 0; i < f.size(); ++i)
+            s[i] = lbm::StorageConversion<Storage, float>::store(f[i]);
+        return s;
+    }
+}
+
+// Comparable and printable form of a stored value for the bitwise tests: the
+// value itself for a floating-point Storage, the bit pattern for P16.
+template <typename T>
+T raw(T x) {
+    return x;
+}
+inline unsigned raw(lbm::P16 x) { return x.bits; }
 
 // ---------------------------------------------------------------------------
 // Geometries

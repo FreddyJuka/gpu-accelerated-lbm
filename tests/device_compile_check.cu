@@ -1,6 +1,7 @@
 // Compile-only check: the lattice, grid, equilibrium, moments, TRT (unforced and forced), storage conversion and
 // pull step code must compile in device code for float and double (and for
-// float storage with double compute) without warnings. The kernels
+// float storage with double compute and P16 storage with float compute)
+// without warnings. The kernels
 // are never launched; results are written to global memory so that the code
 // is not optimized away and the generated SASS can be inspected.
 
@@ -162,5 +163,13 @@ template __global__ void check_pull_step_mixed<float, double>(lbm::Grid2D<L>, co
 template __global__ void check_pull_step_mixed_forced<float, double>(
     lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<double, lbm::UniformForce<double, 2>>,
     const float*, float*);
+template __global__ void check_storage_conversion<lbm::P16, float>(const lbm::P16*, float*,
+                                                                   lbm::P16*);
+template __global__ void check_pull_step_mixed<lbm::P16, float>(lbm::Grid2D<L>, const lbm::NodeType*,
+                                                                lbm::TRT<float>, const lbm::P16*,
+                                                                lbm::P16*);
+template __global__ void check_pull_step_mixed_forced<lbm::P16, float>(
+    lbm::Grid2D<L>, const lbm::NodeType*, lbm::TRT<float, lbm::UniformForce<float, 2>>,
+    const lbm::P16*, lbm::P16*);
 
 } // namespace

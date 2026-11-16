@@ -6,9 +6,10 @@
 // ChannelSetup (as in apps/poiseuille/main.cu): nx = 4, ny = H + 2, wall rows y = 0
 // and y = ny - 1 (halfway bounce-back puts the walls at y = 0.5 and
 // y = ny - 1.5, channel width H), TRT<T, UniformForce<T, 2>>,
-// F_x = 8 nu u_max / H^2, u_max = 0.01, rest initial state. T is the precision
-// of the run (storage and compute type), double or float; the reference, the
-// decay factor and the bounds are evaluated in long double for both.
+// F_x = 8 nu u_max / H^2, u_max = 0.01, rest initial state. T is the compute
+// type of the run, double or float; the populations are stored in T as well,
+// or in lbm::P16 with T = float (see "16-bit storage" below). The reference,
+// the decay factor and the bounds are evaluated in long double throughout.
 //
 // ---------------------------------------------------------------------------
 // Reference solution
@@ -156,6 +157,66 @@
 //    difference under these assumptions is tol_float + tol_double. Wider
 //    channels and smaller viscosities are therefore not validated in float by
 //    this construction.
+//
+// ---------------------------------------------------------------------------
+// 16-bit storage (lbm::P16 buffers, float compute)
+// ---------------------------------------------------------------------------
+// Same setup, measurement, reference and tolerance construction, under the
+// same assumptions, with the float bounds above plus the rounding of the
+// store. The gather of the measurement moves 16-bit patterns; the moments are
+// computed in float from the loaded values (load is exact).
+//
+//  - Storage term of delta_step. Every step ends with store, which replaces
+//    the collision result out_q by the nearest P16 value s_q (K_store = 1: one
+//    rounding per population and step; support/error_bounds.hpp). In terms of
+//    the stored value,
+//      |s_q - out_q| <= e(s_q),  e(s) = kUP16 |s|   if |s| >= kP16MinNormal,
+//                                       kP16Floor   otherwise:
+//    the error is at most half the spacing of the format at out_q. For out_q
+//    in a binade [2^E, 2^(E+1)) of the normal range that is 2^(E-12), and s_q
+//    lies in [2^E, 2^(E+1)], so kUP16 |s_q| >= 2^(E-12). For |out_q| below
+//    kP16MinNormal = 2^-14 it is kP16Floor = 2^-26, and either |s_q| < 2^-14
+//    or s_q = 2^-14, where kUP16 |s_q| = 2^-26 as well. The populations a node
+//    gathers are stored values (streaming and bounce-back move patterns
+//    unchanged), so its collision input deviates from the unrounded one by at
+//    most e(f_q) per population. This changes the mass of the node by at most
+//      store_mass = sum_q e(f_q)
+//    and its momentum by at most
+//      store_j,d  = sum_q |c_qd| e(f_q),
+//    which are added to tol_mass and tol_j,d (store_bound, accumulate_bounds)
+//    and evaluated on the gathered populations like every other term. For
+//    Storage == T both are exactly zero and the float and double bounds are
+//    unchanged. The storage term enters under the same assumption (a) as the
+//    arithmetic round-off: it perturbs the conserved moments by the bound
+//    above and decays with r.
+//
+//  - Size. kUP16 = 2^-12 against the 2^-24 of the float arithmetic: the
+//    storage term dominates delta_step by three orders of magnitude, and the
+//    derived tolerance is 0.4 % (H = 8, nu = 0.5), 1.2 % (H = 8, nu = 1/6),
+//    1.5 % (H = 16, nu = 0.5) and 4.5 % (H = 16, nu = 1/6) of u_max.
+//
+//  - What the cases claim. The slip is 0.52 % (Lambda = 1/4) or 0.87 %
+//    (Lambda = 1/12) of u_max at H = 8 and a quarter of that at H = 16. The
+//    derived tolerance is below it only for H = 8 with nu = 0.5 (0.80 and
+//    0.48 times the slip); there the cases assert |du| > tol_x as in float and
+//    double (SlipClaim::Resolved). In the other cases the tolerance is 1.4 to
+//    34 times the slip: they check u_x against u_a + du, u_y and drho within
+//    the derived bounds WITHOUT claiming to resolve the slip
+//    (SlipClaim::NotClaimed); a result that ignored the slip would pass them.
+//    What they do claim is asserted instead: the tolerance is below the
+//    smallest reference velocity in the channel (the wall-adjacent rows), so
+//    the velocity of every node is resolved and a stalled or grossly wrong
+//    profile fails. p16_slip_claim() encodes the split; it follows from the
+//    derived tolerance alone, and the assertions fail if a case stops meeting
+//    its claim.
+//
+//  - Stopping rule: as in float. The 16-bit runs end at a fixed point of the
+//    rounded scheme (change exactly zero).
+//
+//  - Mean of drho: the accumulation bound n mass_mean now contains
+//    store_mass, about 2^-12 sum_q |f_q| per step. It stays a proven bound
+//    and is checked, but over the 2000 steps of these runs it is of order
+//    4e-3, far above the drift it bounds.
 
 #include <gtest/gtest.h>
 
@@ -175,6 +236,7 @@
 #include "lbm/lattice/d2q9.hpp"
 #include "lbm/moments.hpp"
 #include "lbm/propagation/ab_pull.hpp"
+#include "lbm/storage.hpp"
 #include "support/error_bounds.hpp"
 #include "support/fields.hpp"
 
@@ -258,6 +320,34 @@ struct ChannelSetup {
     }
 };
 
+// Rounding of the store of one population, as a bound in terms of the stored
+// value s (the value the next gather loads), in long double. Zero when the
+// populations are stored in the compute type. For lbm::P16 see "16-bit
+// storage" in the file comment and support/error_bounds.hpp.
+template <typename Storage, typename T>
+ld store_bound(T s) {
+    if constexpr (std::is_same_v<Storage, T>) {
+        (void)s;
+        return 0.0L;
+    } else {
+        static_assert(std::is_same_v<Storage, lbm::P16> && std::is_same_v<T, float>,
+                      "no store rounding bound for this Storage/Compute combination");
+        const ld a = std::abs(static_cast<ld>(s));
+        return K_store * (a >= kP16MinNormal ? kUP16 * a : kP16Floor);
+    }
+}
+
+// Identity collision in the compute type T: the node function then performs
+// the gather only. Each population is converted with load and back with store,
+// which returns the stored value unchanged (identity conversion for
+// Storage == T; store(load(s)) == s for P16).
+template <typename T>
+struct GatherOnly {
+    using compute_type = T;
+    template <typename Lat>
+    LBM_HD void collide(T (&)[Lat::Q]) const {}
+};
+
 template <typename T>
 struct Fields {
     std::vector<T> ux, uy, drho;  // index y * nx + x (walls: 0)
@@ -275,7 +365,8 @@ struct NodeMass {
 };
 
 // delta_step of one node, from its gathered (collision input) populations.
-template <typename T>
+// Storage is the type the populations were stored in (store_bound).
+template <typename Storage, typename T>
 NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const T (&F)[L::D],
                            ld wp, ld wm, Bounds& b) {
     const ld eps = kEps<T>;
@@ -305,8 +396,16 @@ NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const
             sW[d] += ac * W;
         }
     }
+    // Storage rounding carried by the gathered populations (zero for Storage == T).
+    ld store_mass = 0;
+    ld store_j[L::D] = {0, 0};
+    for (int q = 0; q < L::Q; ++q) {
+        const ld e = store_bound<Storage, T>(f[q]);
+        store_mass += e;
+        for (int d = 0; d < L::D; ++d) store_j[d] += std::abs(static_cast<ld>(L::c(q, d))) * e;
+    }
     const ld tol_mass = wp * (K_sum * eps * S + (K_e * eps + K_w * uT) * sum_scale) +
-                        K_chain * uT * sum_chain + (K_src + K_w) * uT * sum_W;
+                        K_chain * uT * sum_chain + (K_src + K_w) * uT * sum_W + store_mass;
     const ld d_rho = tol_mass + K_sum * eps * S;  // + measurement
     const ld rho = 1.0L + static_cast<ld>(drho);
     ld du[L::D];
@@ -315,7 +414,7 @@ NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const
         const ld meas_j = K_sum * eps * S + K_div * uT * (S + 0.5L * Fd);
         const ld tol_j = wm * (K_sum * eps * S + (K_e * eps + K_w * uT) * sc[d] +
                                K_div * uT * (S + 0.5L * Fd)) +
-                         K_chain * uT * schain[d] + (K_src + K_w) * uT * sW[d];
+                         K_chain * uT * schain[d] + (K_src + K_w) * uT * sW[d] + store_j[d];
         du[d] = (tol_j + meas_j + std::abs(static_cast<ld>(u[d])) * d_rho) / rho;
     }
     b.ux = std::max(b.ux, du[0]);
@@ -326,14 +425,15 @@ NodeMass accumulate_bounds(const T (&f)[L::Q], T drho, const T (&u)[L::D], const
 
 // Fields of the stored post-collision populations, measured on the gathered
 // populations (see the file comment); also accumulates the step bounds.
-template <typename T>
-Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds& bounds) {
+template <typename T, typename Storage>
+Fields<T> measure(const ChannelSetup<T>& s, const std::vector<Storage>& stored, Bounds& bounds) {
+    using Conversion = lbm::StorageConversion<Storage, T>;
     const Grid& g = s.g;
-    std::vector<T> gathered = stored;
+    std::vector<Storage> gathered = stored;
     for (int y = 0; y < g.ny(); ++y)
         for (int x = 0; x < g.nx(); ++x)
-            lbm::pull_stream_collide<L, T>(g, s.flags.data(), stored.data(), gathered.data(),
-                                           IdentityCollision{}, x, y);
+            lbm::pull_stream_collide<L, Storage>(g, s.flags.data(), stored.data(), gathered.data(),
+                                                 GatherOnly<T>{}, x, y);
     Fields<T> r;
     const std::size_t n = static_cast<std::size_t>(g.num_nodes());
     r.ux.assign(n, T(0));
@@ -346,14 +446,15 @@ Fields<T> measure(const ChannelSetup<T>& s, const std::vector<T>& stored, Bounds
         for (int x = 0; x < g.nx(); ++x) {
             if (s.flags[static_cast<std::size_t>(g.node(x, y))] == lbm::NodeType::Wall) continue;
             T f[L::Q], u[2], drho;
-            for (int q = 0; q < L::Q; ++q) f[q] = gathered[static_cast<std::size_t>(g.idx(q, x, y))];
+            for (int q = 0; q < L::Q; ++q)
+                f[q] = Conversion::load(gathered[static_cast<std::size_t>(g.idx(q, x, y))]);
             lbm::moments_shifted_forced<L, T>(f, F, drho, u);
             const std::size_t i = static_cast<std::size_t>(g.node(x, y));
             r.ux[i] = u[0];
             r.uy[i] = u[1];
             r.drho[i] = drho;
-            const NodeMass m = accumulate_bounds(f, drho, u, F, s.coll.omega_plus(),
-                                                 s.coll.omega_minus(), bounds);
+            const NodeMass m = accumulate_bounds<Storage, T>(f, drho, u, F, s.coll.omega_plus(),
+                                                             s.coll.omega_minus(), bounds);
             sum_mass += m.mass;
             sum_meas += m.meas;
             ++fluid;
@@ -407,11 +508,20 @@ Effective effective_parameters(const ChannelSetup<T>& s) {
     return e;
 }
 
+// What a case claims about the slip. Resolved: the derived tolerance must be
+// below the slip (asserted for Lambda != 3/16), so the case validates the slip
+// formula. NotClaimed: the profile is checked against u_a + du within the
+// derived tolerance only; the tolerance may exceed the slip, and the case then
+// does not distinguish u_a + du from u_a (16-bit storage, see the file comment).
+enum class SlipClaim { Resolved, NotClaimed };
+
 // Stepper interface used by check_case:
 //   void advance(int n)                          n steps with alternating buffers
-//   const std::vector<T>& state()                stored populations (host copy)
+//   const std::vector<Storage>& state()          stored populations (host copy)
+// The storage type is the element type of state(); T is the compute type.
 template <typename T, typename Stepper>
-void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
+void check_case(const ChannelSetup<T>& s, Stepper& stepper, SlipClaim claim = SlipClaim::Resolved) {
+    using Storage = typename std::decay_t<decltype(stepper.state())>::value_type;
     const Case& c = s.c;
     const Grid& g = s.g;
     const int ny = g.ny();
@@ -480,6 +590,7 @@ void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
         }
 
     std::cout << "[ info ] " << case_name(c) << (sizeof(T) == sizeof(float) ? " float" : " double")
+              << (std::is_same_v<Storage, T> ? "" : (sizeof(Storage) == 2 ? " (P16 storage)" : " (mixed storage)"))
               << ": steps " << steps << ", du/umax "
               << static_cast<double>(du / kUmax) << ", err_x/umax "
               << static_cast<double>(err_x / kUmax) << " (tol "
@@ -496,8 +607,15 @@ void check_case(const ChannelSetup<T>& s, Stepper& stepper) {
 
     // The tolerance must be below the slip, otherwise a result that ignores
     // the slip could pass.
-    if (c.lambda != 3.0 / 16.0) {
+    if (claim == SlipClaim::Resolved && c.lambda != 3.0 / 16.0) {
         EXPECT_GT(std::abs(du), tol_x) << "slip not resolved, " << case_name(c);
+    }
+    // Without the slip claim the case still has to resolve the velocity of
+    // every node: the tolerance is below the smallest reference velocity.
+    if (claim == SlipClaim::NotClaimed) {
+        ld u_ref_min = std::abs(analytic(1) + du);
+        for (int y = 1; y < ny - 1; ++y) u_ref_min = std::min(u_ref_min, std::abs(analytic(y) + du));
+        EXPECT_GT(u_ref_min, tol_x) << "profile not resolved, " << case_name(c);
     }
 }
 
@@ -516,6 +634,15 @@ inline std::vector<Case> float_cases() {
     for (const Case& c : all_cases())
         if (c.H == 8 || c.nu == 0.5) v.push_back(c);
     return v;
+}
+
+// Cases of the 16-bit storage tests: all of all_cases(). Those whose derived
+// tolerance is below the slip claim to resolve it; the others do not (see
+// "16-bit storage" in the file comment).
+inline std::vector<Case> p16_cases() { return all_cases(); }
+
+inline SlipClaim p16_slip_claim(const Case& c) {
+    return (c.H == 8 && c.nu == 0.5) ? SlipClaim::Resolved : SlipClaim::NotClaimed;
 }
 
 }  // namespace poiseuille

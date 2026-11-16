@@ -140,6 +140,26 @@ inline constexpr ld K_uF = 3.0L;
 // for the second-order terms of (1 + u)^n - 1 (about 100 u_ld^2).
 inline constexpr ld K_feq_ld = 8.0L;
 
+// P16 storage (lbm/storage.hpp), store = round to nearest of a binary32 value
+// to the 16-bit format, one rounding per stored population. The format has 12
+// significant bits in its normal range and the fixed spacing 2^-25 below it:
+//   |x| in [kP16MinNormal, kP16MaxRounding]: the result is the nearest of the
+//     values n 2^(E - 11), with 2^E <= |x| < 2^(E + 1), so
+//     |err| <= 2^(E - 12) <= kUP16 |x|,  kUP16 = 2^-12  (the unit roundoff);
+//   |x| < kP16MinNormal: nearest multiple of 2^-25, |err| <= kP16Floor = 2^-26.
+// Both cases are covered by |err| <= K_store (kUP16 |x| + kP16Floor), the form
+// used where the range of x is not known. K_store = 1 is the count: one
+// rounding. load is exact. All of these are powers of two, hence exact in
+// long double. Verified for every float in tests/test_storage.cpp.
+inline constexpr ld kUP16 = 1.0L / 4096.0L;                 // 2^-12
+inline constexpr ld kP16Floor = 1.0L / 67108864.0L;         // 2^-26
+inline constexpr ld kP16MinNormal = 1.0L / 16384.0L;        // 2^-14
+// Largest magnitude that store maps to a finite value: the tie between the
+// largest finite value 2 - 2^-10 and the next step, which rounds to even.
+inline constexpr ld kP16MaxRounding = 2.0L - 1.0L / 1024.0L + 1.0L / 4096.0L;
+inline constexpr ld K_store = 1.0L;
+static_assert(K_store <= 16.0L, "every factor must not exceed 16");
+
 static_assert(K_acc <= 16.0L && K_sum <= 16.0L && K_u <= 16.0L && K_div <= 16.0L &&
                   K_e <= 16.0L && K_chain <= 16.0L && K_src <= 16.0L && K_w <= 16.0L &&
                   K_uF <= 16.0L && K_feq_ld <= 16.0L,

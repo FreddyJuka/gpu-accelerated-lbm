@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
 #include <type_traits>
@@ -28,6 +29,7 @@
 #include "lbm/storage.hpp"
 #include "support/fields.hpp"
 #include "support/fp_environment.hpp"
+#include "support/p16_reference.hpp"
 
 using namespace lbmtest;
 
@@ -283,4 +285,131 @@ TEST(StepCpuMixed, CompositionFloatStorageDoubleComputeForced) {
         0.01, 3.0 / 16.0, lbm::UniformForce<float, 2>::create(F));
     ASSERT_NE(trt.omega_plus(), trt.omega_minus());
     for (const auto& flags : mixed_flag_sets()) check_mixed_composition(trt, trt_float, flags);
+}
+
+// ---------------------------------------------------------------------------
+// g. 16-bit storage: lbm::P16 buffers, float compute.
+// ---------------------------------------------------------------------------
+// The step is, for every fluid node and population, bitwise equal to
+//
+//   gather the 16-bit patterns (plain pull, or the node's own opposite
+//   population when the source node is a wall)
+//   -> decode each to float                      (load, exact)
+//   -> TRT<float>::collide                       (same code path)
+//   -> round each result to the nearest P16 value, ties to even   (store)
+//
+// with the decode and the rounding done by the reference of
+// support/p16_reference.hpp (std::ldexp and exact long double comparisons),
+// not through StorageConversion. The initial field is built with the reference
+// as well. The gather uses explicit modular arithmetic and reads the flags
+// directly. Wall nodes keep the sentinel pattern.
+//
+// Guards: the store must round in at least one population (the collided float
+// is not representable in 16 bits), so the comparison does check the
+// rounding, and no result may be the invalid pattern.
+namespace {
+
+template <typename Trt>
+void check_p16_composition(const Trt& trt, const std::vector<lbm::NodeType>& flags) {
+    static_assert(std::is_same_v<lbm::collision_compute_t<Trt, lbm::P16>, float>);
+    const Grid g(NX, NY);
+    const std::vector<ld> values = p16_magnitude_values();
+    const std::uint16_t sentinel = 0x5A5Au;
+
+    const std::vector<float> init = nonuniform_field<float>(g);
+    std::vector<lbm::P16> src(init.size());
+    for (std::size_t i = 0; i < init.size(); ++i) src[i].bits = p16_reference_store(init[i], values);
+    std::vector<lbm::P16> dst(src.size(), lbm::P16{sentinel});
+    lbm::step_cpu<L, lbm::P16>(g, flags.data(), src.data(), dst.data(), trt);
+
+    auto wall = [&](int x, int y) {
+        return flags[static_cast<std::size_t>(g.node(mod(x, NX), mod(y, NY)))] == lbm::NodeType::Wall;
+    };
+
+    int fluid_nodes = 0;
+    int rounded = 0;
+    for (int y = 0; y < NY; ++y)
+        for (int x = 0; x < NX; ++x) {
+            if (wall(x, y)) {
+                for (int q = 0; q < L::Q; ++q)
+                    ASSERT_EQ(dst[static_cast<std::size_t>(g.idx(q, x, y))].bits, sentinel)
+                        << "wall node written: q=" << q << " x=" << x << " y=" << y;
+                continue;
+            }
+            ++fluid_nodes;
+
+            float f[L::Q];
+            for (int q = 0; q < L::Q; ++q) {
+                const int xs = x - L::c(q, 0);
+                const int ys = y - L::c(q, 1);
+                const lbm::P16 s = wall(xs, ys) ? src[static_cast<std::size_t>(g.idx(L::opp(q), x, y))]
+                                                : src[static_cast<std::size_t>(pull_src_index(g, q, x, y))];
+                f[q] = p16_reference_load(s.bits);
+            }
+            trt.template collide<L>(f);
+
+            for (int q = 0; q < L::Q; ++q) {
+                const std::uint16_t expected = p16_reference_store(f[q], values);
+                ASSERT_NE(expected & 0x7FFFu, kP16Invalid) << "q=" << q << " x=" << x << " y=" << y;
+                ASSERT_EQ(dst[static_cast<std::size_t>(g.idx(q, x, y))].bits, expected)
+                    << "q=" << q << " x=" << x << " y=" << y;
+                if (p16_reference_load(expected) != f[q]) ++rounded;
+            }
+        }
+    EXPECT_GT(fluid_nodes, 0);
+    EXPECT_GT(rounded, 0);
+}
+
+} // namespace
+
+TEST(StepCpuP16, CompositionP16StorageFloatCompute) {
+    const auto trt = lbm::TRT<float>::from_viscosity<L>(0.01, 3.0 / 16.0);
+    ASSERT_NE(trt.omega_plus(), trt.omega_minus());
+    for (const auto& flags : mixed_flag_sets()) check_p16_composition(trt, flags);
+}
+
+// Both force components nonzero, so the symmetric and the antisymmetric source
+// are both active.
+TEST(StepCpuP16, CompositionP16StorageFloatComputeForced) {
+    const double F[2] = {3e-5, -7e-5};
+    const auto trt = lbm::TRT<float, lbm::UniformForce<float, 2>>::from_viscosity<L>(
+        0.01, 3.0 / 16.0, lbm::UniformForce<float, 2>::create(F));
+    ASSERT_NE(trt.omega_plus(), trt.omega_minus());
+    for (const auto& flags : mixed_flag_sets()) check_p16_composition(trt, flags);
+}
+
+// Pure propagation of P16 buffers moves the 16-bit patterns unchanged: with a
+// collision that computes in float and leaves the populations alone, every
+// pattern is decoded and encoded again, and store(load(s)) == s. The field
+// holds every finite pattern class (zeros of both signs, subnormal and normal
+// values); one pass over all 65534 finite patterns is in test_storage.cpp.
+namespace {
+
+struct IdentityFloatCollision {
+    using compute_type = float;
+    template <typename Lat>
+    LBM_HD void collide(float (&)[Lat::Q]) const {}
+};
+
+} // namespace
+
+TEST(StepCpuP16, PurePropagationMovesPatternsUnchanged) {
+    const Grid g(NX, NY);
+    const std::vector<lbm::NodeType> flags = all_fluid(g);
+    std::vector<lbm::P16> src(static_cast<std::size_t>(L::Q * g.num_nodes()));
+    // Distinct finite patterns spread over the whole 16-bit range: 315 values
+    // with stride 207 (< 65536 / 315), none of them 0x7FFF or 0xFFFF (asserted).
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        src[i].bits = static_cast<std::uint16_t>(i * 207u);
+        ASSERT_NE(src[i].bits & 0x7FFFu, kP16Invalid);
+    }
+    src[1].bits = 0x8000u;  // negative zero
+    std::vector<lbm::P16> dst(src.size(), lbm::P16{0x5A5Au});
+    lbm::step_cpu<L, lbm::P16>(g, flags.data(), src.data(), dst.data(), IdentityFloatCollision{});
+    for (int q = 0; q < L::Q; ++q)
+        for (int y = 0; y < NY; ++y)
+            for (int x = 0; x < NX; ++x)
+                ASSERT_EQ(dst[static_cast<std::size_t>(g.idx(q, x, y))].bits,
+                          src[static_cast<std::size_t>(pull_src_index(g, q, x, y))].bits)
+                    << "q=" << q << " x=" << x << " y=" << y;
 }

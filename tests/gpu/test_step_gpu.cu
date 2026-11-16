@@ -8,6 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +24,7 @@
 #include "lbm/equilibrium.hpp"
 #include "lbm/grid.hpp"
 #include "lbm/lattice/d2q9.hpp"
+#include "lbm/storage.hpp"
 #include "support/fields.hpp"
 #include "support/fp_environment.hpp"
 
@@ -45,8 +49,9 @@ template <typename T>
 void expect_equal(const std::vector<T>& a, const std::vector<T>& b, const std::string& what) {
     ASSERT_EQ(a.size(), b.size());
     for (std::size_t i = 0; i < a.size(); ++i)
-        if (a[i] != b[i]) {
-            ADD_FAILURE() << what << ": first mismatch at index " << i << ": " << a[i] << " vs " << b[i];
+        if (raw(a[i]) != raw(b[i])) {
+            ADD_FAILURE() << what << ": first mismatch at index " << i << ": " << raw(a[i]) << " vs "
+                          << raw(b[i]);
             return;
         }
 }
@@ -60,7 +65,7 @@ TYPED_TEST_SUITE(StepGpu, PrecisionTypes);
 
 // Bodies shared by the unforced and the forced collision. Trt is
 // TRT<T> or TRT<T, UniformForce<T, 2>>; for the mixed-precision tests T is
-// the storage type (float) and Trt computes in double.
+// the storage type (float, or lbm::P16) and Trt computes in double (or float).
 namespace {
 
 template <typename T, typename Trt>
@@ -68,7 +73,7 @@ void check_one_step(const Trt& trt, const std::string& tag) {
     for (const GridSize s : kSizes)
         for (const Geometry geo : kGeometries) {
             const Grid g(s.nx, s.ny);
-            const std::vector<T> init = nonuniform_field<T>(g);
+            const std::vector<T> init = nonuniform_stored_field<T>(g);
             const std::vector<lbm::NodeType> flags = make_flags(g, geo);
             const int n = static_cast<int>(init.size());
 
@@ -94,7 +99,7 @@ void check_hundred_steps(const Trt& trt, const std::string& tag) {
     for (const GridSize s : kSizes)
         for (const Geometry geo : kGeometries) {
             const Grid g(s.nx, s.ny);
-            const std::vector<T> init = nonuniform_field<T>(g);
+            const std::vector<T> init = nonuniform_stored_field<T>(g);
             const std::vector<lbm::NodeType> flags = make_flags(g, geo);
             const int n = static_cast<int>(init.size());
 
@@ -179,6 +184,103 @@ TEST(StepGpuMixed, HundredStepsMatchCpu) {
 
 TEST(StepGpuMixed, HundredStepsForcedMatchesCpu) {
     check_hundred_steps<float>(forced_trt<double>(), "mixed forced ");
+}
+
+// b4. 16-bit storage: buffers of lbm::P16 (host vectors and device buffers)
+// with float compute. Same bodies and comparison: bitwise on the 16-bit
+// patterns, 7 x 5 and 200 x 37, channel and single wall, 1 step and 100 steps
+// (compared after step 1, 50 and 100), unforced and forced. Load and store are
+// integer operations on the bit patterns (lbm/storage.hpp), identical on both
+// sides by construction; the float collision between them is the one of the
+// float tests above. The initial field is the float field converted with
+// store. Over 100 steps the stored rounding of every step feeds the next one,
+// so a single differing conversion on either side would show.
+TEST(StepGpuP16, OneStepMatchesCpu) {
+    check_one_step<lbm::P16>(lbm::TRT<float>::from_viscosity<L>(0.01, 3.0 / 16.0), "P16 unforced ");
+}
+
+TEST(StepGpuP16, OneStepForcedMatchesCpu) {
+    check_one_step<lbm::P16>(forced_trt<float>(), "P16 forced ");
+}
+
+TEST(StepGpuP16, HundredStepsMatchCpu) {
+    check_hundred_steps<lbm::P16>(lbm::TRT<float>::from_viscosity<L>(0.01, 3.0 / 16.0),
+                                  "P16 unforced ");
+}
+
+TEST(StepGpuP16, HundredStepsForcedMatchesCpu) {
+    check_hundred_steps<lbm::P16>(forced_trt<float>(), "P16 forced ");
+}
+
+// b5. The conversion alone on the device: store of 2^20 binary32 values spread
+// over all bit patterns (every 4093rd, a prime stride; zeros, subnormals, the
+// overflow range, infinities and NaNs included) and load of all 65536
+// patterns, each compared bitwise with the host result of the same function.
+// The host functions are tested against the exact reference in
+// test_storage.cpp.
+namespace {
+
+__global__ void p16_store_kernel(const float* in, lbm::P16* out, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = lbm::StorageConversion<lbm::P16, float>::store(in[i]);
+}
+
+__global__ void p16_load_kernel(const lbm::P16* in, float* out, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = lbm::StorageConversion<lbm::P16, float>::load(in[i]);
+}
+
+std::uint32_t bits_of(float x) {
+    std::uint32_t b;
+    std::memcpy(&b, &x, sizeof b);
+    return b;
+}
+
+} // namespace
+
+TEST(StepGpuP16, ConversionMatchesHostBitwise) {
+    using C16 = lbm::StorageConversion<lbm::P16, float>;
+    const int n_store = 1 << 20;
+    std::vector<float> x(static_cast<std::size_t>(n_store));
+    for (int i = 0; i < n_store; ++i) {
+        const std::uint32_t b = static_cast<std::uint32_t>(i) * 4093u;
+        std::memcpy(&x[static_cast<std::size_t>(i)], &b, sizeof b);
+    }
+    lbm::DeviceBuffer<float> d_x(n_store);
+    lbm::DeviceBuffer<lbm::P16> d_s(n_store);
+    d_x.copy_from_host(x.data(), n_store);
+    p16_store_kernel<<<(n_store + 255) / 256, 256>>>(d_x.data(), d_s.data(), n_store);
+    LBM_CUDA_CHECK(cudaGetLastError());
+    LBM_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<lbm::P16> stored(static_cast<std::size_t>(n_store));
+    d_s.copy_to_host(stored.data(), n_store);
+    int mismatches = 0;
+    for (int i = 0; i < n_store; ++i) {
+        const std::size_t k = static_cast<std::size_t>(i);
+        // A NaN input is not guaranteed to keep its sign bit on its way through
+        // host code; compare the magnitude bits there.
+        const unsigned mask = std::isnan(x[k]) ? 0x7FFFu : 0xFFFFu;
+        if ((stored[k].bits & mask) != (C16::store(x[k]).bits & mask) && ++mismatches <= 10)
+            ADD_FAILURE() << "store, input bits " << bits_of(x[k]) << ": device " << stored[k].bits
+                          << ", host " << C16::store(x[k]).bits;
+    }
+    EXPECT_EQ(mismatches, 0);
+
+    const int n_load = 1 << 16;
+    std::vector<lbm::P16> patterns(static_cast<std::size_t>(n_load));
+    for (int i = 0; i < n_load; ++i) patterns[static_cast<std::size_t>(i)].bits = static_cast<std::uint16_t>(i);
+    lbm::DeviceBuffer<lbm::P16> d_p(n_load);
+    lbm::DeviceBuffer<float> d_v(n_load);
+    d_p.copy_from_host(patterns.data(), n_load);
+    p16_load_kernel<<<(n_load + 255) / 256, 256>>>(d_p.data(), d_v.data(), n_load);
+    LBM_CUDA_CHECK(cudaGetLastError());
+    LBM_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> loaded(static_cast<std::size_t>(n_load));
+    d_v.copy_to_host(loaded.data(), n_load);
+    for (int i = 0; i < n_load; ++i) {
+        const std::size_t k = static_cast<std::size_t>(i);
+        ASSERT_EQ(bits_of(loaded[k]), bits_of(C16::load(patterns[k]))) << "load, pattern " << i;
+    }
 }
 
 // c. Launcher rejection.
