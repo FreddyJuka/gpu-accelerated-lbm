@@ -79,7 +79,7 @@ is thermally limited (1.46x on a cool GPU), not the 1.97x of the traffic ratio,
 because the integer conversion makes the kernel instruction-bound. Its main
 limitation is accuracy: a force-driven flow started from rest stalls at a fixed
 point of the rounded scheme short of the steady state, with an error that
-scales as $c \, 2^{-12} H^2/\nu$ ($c$ between 0.012 and 0.033 in the measured
+scales as $c \, 2^{-12} \tfrac{H^2}{\nu}$ ($c$ between 0.012 and 0.033 in the measured
 cases). Details: [DESIGN.md, section 3](docs/DESIGN.md#3-numerical-precision).
 
 ## Validation: Poiseuille flow
@@ -94,33 +94,33 @@ $$
 $$
 
 (Ginzburg, Verhaeghe, d'Humieres 2008, Eq. (2.29) and Table 1), which vanishes
-at $\Lambda = 3/16$.
+at $\Lambda = \tfrac{3}{16}$.
 
 Measured with `apps/poiseuille` in double precision on the GPU, for
-$\Lambda = 3/16$ and $\Lambda = 1/4$, $H = 8, 16, 32, 64$ and $\nu = 0.01, 1/6, 0.5$: the
+$\Lambda = \tfrac{3}{16}$ and $\Lambda = \tfrac{1}{4}$, $H = 8, 16, 32, 64$ and $\nu = 0.01, \tfrac{1}{6}, 0.5$: the
 numerical profile equals the parabola plus $\Delta u$ at round-off level (residual at
 most $2.7\times10^{-12}\,u_{\max}$, see [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow)
-for details and caveats). $\Lambda = 1/12$ is covered by the tests.
+for details and caveats). $\Lambda = \tfrac{1}{12}$ is covered by the tests.
 
 ![Poiseuille profiles, deviation from the parabola and residual against the slip formula](docs/images/poiseuille.png)
 
-*Case $H = 16$, $\nu = 1/6$: the numerical profiles (a), their offset from the
+Case $H = 16$, $\nu = \tfrac{1}{6}$: the numerical profiles (a), their offset from the
 parabola against the predicted slip (b), and the residual against the slip
-formula (c).*
+formula (c).
 
 What each precision is validated for:
 
-- **Double:** all test cases ($H = 8, 16$; $\nu = 1/6, 1/2$;
-  $\Lambda = 3/16, 1/4, 1/12$), CPU and GPU.
+- **Double:** all test cases ($H = 8, 16$; $\nu = \tfrac{1}{6}, \tfrac{1}{2}$;
+  $\Lambda = \tfrac{3}{16}, \tfrac{1}{4}, \tfrac{1}{12}$), CPU and GPU.
 - **Float:** only the cases in which the derived tolerance is below the slip
-  ($H = 8$ with both viscosities, $H = 16$ with $\nu = 1/2$), CPU and GPU. In
+  ($H = 8$ with both viscosities, $H = 16$ with $\nu = \tfrac{1}{2}$), CPU and GPU. In
   the wider and less viscous channels the derived float tolerance is not below
   the slip, so those cases would not validate the slip formula and are not in
   the float tests. Measured with the app (`--compute float`), the float error
-  is below the slip in 10 of the 12 cases with $\Lambda = 1/4$, but not at
+  is below the slip in 10 of the 12 cases with $\Lambda = \tfrac{1}{4}$, but not at
   $\nu = 0.01$ with $H = 32$ and $H = 64$.
 - **P16:** 12 cases per backend with weaker claims: the slip is claimed to be
-  resolved only for $H = 8$, $\nu = 1/2$; in the other cases the tests check
+  resolved only for $H = 8$, $\nu = \tfrac{1}{2}$; in the other cases the tests check
   $u_x$, $u_y$ and $\rho$ within the derived bounds without claiming to resolve
   the slip, and check that the tolerance is below the smallest reference
   velocity in the channel.
