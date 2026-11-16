@@ -23,15 +23,30 @@ Implemented and verified:
 - Periodic domains
 - Fused pull stream-collide with two buffers, on CPU and GPU, sharing one node
   function
+- `<Storage, Compute>` precision split through a storage conversion trait:
+  float/float, double/double, float storage with double compute, and
+  experimental 16-bit storage (P16) with float compute
 - Poiseuille channel validation on CPU and GPU
+- Benchmark application for the GPU step
+
+Limitations, stated plainly:
+
+- Two-dimensional only. Equilibrium, moments, force and collision are
+  lattice-generic; `Grid2D`, the node function and the kernels are 2D and need
+  3D counterparts ([DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)).
+- P16 storage is experimental and does not reproduce the Poiseuille validation
+  at float quality (see below).
+- The Poiseuille tolerance is not a proven bound (see below).
+- Measurements come from one machine (RTX 3050 Laptop under WSL2).
 
 Not done yet: see the [Roadmap](#roadmap).
 
 ## Design highlights
 
-- Lattice-generic templates (D2Q9 now, D3Q19 planned):
-  [DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)
-- `<Storage, Compute>` precision templates with DDF-shifting:
+- Lattice-generic templates for the collision-side code (D2Q9 now, D3Q19
+  planned): [DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)
+- `<Storage, Compute>` precision templates with shifted populations
+  (DDF-shifting) and a conversion trait:
   [section 3](docs/DESIGN.md#3-numerical-precision)
 - Structure-of-arrays layout with $x$ as the fastest index:
   [section 4](docs/DESIGN.md#4-memory-layout-soa)
@@ -39,9 +54,33 @@ Not done yet: see the [Roadmap](#roadmap).
   [section 5](docs/DESIGN.md#5-propagation-fused-pull-two-buffers)
 - Validated 32-bit indexing (`Q*N <= INT32_MAX`):
   [section 8](docs/DESIGN.md#8-grid-indexing-and-node-types)
+- One thread per node over the flattened node index:
+  [section 9](docs/DESIGN.md#9-gpu-execution-and-verification)
 - Collision and force as template policies:
   [section 2](docs/DESIGN.md#2-collision-operator-trt) and
   [section 11](docs/DESIGN.md#11-body-force)
+
+### Precision configurations
+
+| Storage / compute | Bytes per node update | Status |
+|---|---|---|
+| double / double | 145 | reference for validation |
+| float / float | 73 | default performance configuration |
+| float / double (mixed) | 73 | implemented, tested bitwise CPU-vs-GPU |
+| P16 / float | 37 | experimental |
+
+Bytes per node update is `2 * 9 * sizeof(Storage) + 1` (two buffers of nine
+populations plus one flag byte). P16 is a 16-bit format with 1 sign, 4
+exponent and 11 mantissa bits, range up to $2 - 2^{-10}$, rounding to nearest
+(ties to even) and an invalid pattern (NaN) on overflow. It halves the
+population memory (8192 x 8192 fits in 4 GB; float storage stops at
+4096 x 4096) and is 1.29x faster than float/float on large grids when the GPU
+is thermally limited (1.46x on a cool GPU), not the 1.97x of the traffic ratio,
+because the integer conversion makes the kernel instruction-bound. Its main
+limitation is accuracy: a force-driven flow started from rest stalls at a fixed
+point of the rounded scheme short of the steady state, with an error that
+scales as $c \, 2^{-12} H^2/\nu$ ($c$ between 0.012 and 0.033 in the measured
+cases). Details: [DESIGN.md, section 3](docs/DESIGN.md#3-numerical-precision).
 
 ## Validation: Poiseuille flow
 
@@ -69,6 +108,35 @@ for details and caveats). $\Lambda = 1/12$ is covered by the tests.
 parabola against the predicted slip (b), and the residual against the slip
 formula (c).*
 
+What each precision is validated for:
+
+- **Double:** all test cases ($H = 8, 16$; $\nu = 1/6, 1/2$;
+  $\Lambda = 3/16, 1/4, 1/12$), CPU and GPU.
+- **Float:** only the cases in which the derived tolerance is below the slip
+  ($H = 8$ with both viscosities, $H = 16$ with $\nu = 1/2$), CPU and GPU. In
+  the wider and less viscous channels the derived float tolerance is not below
+  the slip, so those cases would not validate the slip formula and are not in
+  the float tests. Measured with the app (`--compute float`), the float error
+  is below the slip in 10 of the 12 cases with $\Lambda = 1/4$, but not at
+  $\nu = 0.01$ with $H = 32$ and $H = 64$.
+- **P16:** 12 cases per backend with weaker claims: the slip is claimed to be
+  resolved only for $H = 8$, $\nu = 1/2$; in the other cases the tests check
+  $u_x$, $u_y$ and $\rho$ within the derived bounds without claiming to resolve
+  the slip, and check that the tolerance is below the smallest reference
+  velocity in the channel.
+
+The Poiseuille tolerance rests on a stated physical assumption, the decay rate
+of the slowest hydrodynamic mode of the channel, and is not a proven bound.
+Only the mean-density part is a proven bound: it follows from accumulating the
+per-step mass error of the collision over the steps run. Details in
+[DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow).
+
+The app options `--compute double|float` and `--storage same|float|p16` make
+the float and P16 measurements reproducible:
+
+    ./build/apps/lbm_poiseuille --compute float
+    ./build/apps/lbm_poiseuille --compute float --storage p16
+
 To regenerate the figure (requires the CSV files written by `lbm_poiseuille`
 into `output/`, see below):
 
@@ -76,22 +144,77 @@ into `output/`, see below):
     .venv/bin/pip install -r scripts/requirements.txt
     .venv/bin/python scripts/plot_poiseuille.py
 
+## Performance
+
+`apps/benchmark` (`lbm_benchmark`) times the production launcher `lbm::step_gpu`
+with CUDA events and reports MLUPS, the effective bandwidth for the minimum
+traffic per node update, and the fraction of the bandwidth of a
+device-to-device copy kernel measured in the same run. Methodology and
+conditions: [DESIGN.md, section 13](docs/DESIGN.md#13-performance).
+
+Results on an RTX 3050 Laptop GPU (4 GB, 192 GB/s theoretical peak, copy kernel
+about 183 GB/s), WSL2, on AC power, 2048 x 2048 channel, median of 7
+repetitions, GPU cool at the start:
+
+| Storage / compute | Unforced MLUPS | % of copy | Forced MLUPS | % of copy |
+|---|---|---|---|---|
+| float / float | 2516 | 100.0 | 2516 | 100.0 |
+| P16 / float | 3662 | 73.8 | 3292 | 66.3 |
+| double / double | 354 | 27.9 | 237 | 18.7 |
+| float / double | 316 | 12.6 | 219 | 8.7 |
+
+- Float is at about 100 % of the copy-kernel bandwidth on large grids: it
+  cannot go faster without moving fewer bytes.
+- Double is bound by the FP64 pipe of this GPU (1/64 of the FP32 rate), not by
+  memory.
+- Small grids (float up to 256 x 256) are bound by the kernel launch cost
+  under WSL2 (about 10 us per launch).
+- P16 speed-up over float/float on large grids: 1.29x unforced and 1.14x forced
+  with the GPU thermally limited (4096 x 4096), 1.46x and 1.31x on a cool GPU.
+- Nsight Compute counters cannot be collected on this machine, so the
+  bound-by statements come from instruction counts and rooflines, not from
+  hardware counters.
+
+The measurements depend on the thermal and power state of the GPU; the
+conditions are given in the DESIGN section. To reproduce:
+
+    ./build/apps/lbm_benchmark --storage all --sizes 2048 --geometry channel --reps 7 --rep-ms 500
+    ./build/apps/lbm_benchmark --storage float,p16 --sizes 1024,2048,4096,8192 --reps 7 --rep-ms 500
+
 ## Verification approach
 
 - Test tolerances are derived from floating-point error bounds and operation
-  counts, never tuned against the data.
+  counts (shared constants with their derivations in
+  `tests/support/error_bounds.hpp`), never tuned against the data. The stated
+  exception is the Poiseuille tolerance, which rests on a physical estimate of
+  the decay rate (see above).
 - Mutation checks during development: components were deliberately broken and
   the tests were checked for failure. For example, the symmetric part of the
   Guo source term is not exercised by the Poiseuille flow (removing it leaves
-  the steady profile unchanged at round-off level), so it is covered by the
-  composition test in `tests/test_force.cpp`.
-- CPU and GPU kernels are compared bitwise; the GPU comparison tests are
-  compiled with `--fmad=false`.
+  the steady profile unchanged at round-off level). It is tested
+  independently by the second moment of the collision in long double
+  (`ForceCollide.SecondMomentIncludesSymmetricSource`); the composition test in
+  `tests/test_force.cpp` only pins the expression of the code.
+- The accuracy of the forced collision in float and double is tested against
+  the same library code evaluated in long double
+  (`ForceTest.ForcedCollisionMatchesLongDoubleReference`). That test checks
+  rounding, not the formula.
+- CPU and GPU kernels are compared bitwise, including the forced collision,
+  float storage with double compute, and P16 storage; the GPU comparison tests
+  are compiled with `--fmad=false`.
+- The exact and bitwise tests assume IEEE binary32/binary64 arithmetic without
+  excess precision (checked at compile time) and without contraction of
+  `a*b+c` into FMA on the host, which every test target enforces with
+  `-ffp-contract=off`.
 - Poiseuille validation runs on the CPU and on the GPU (the latter with
-  production compiler flags).
-- CI builds everything, including the CUDA code, with warnings as errors and
-  runs the CPU tests. GitHub-hosted runners have no GPU, so the GPU tests are
-  built but run locally.
+  production compiler flags, i.e. nvcc's default FMA contraction; the
+  tolerance derivation is not argued separately for fused arithmetic).
+- CI has three jobs: a CUDA build (all targets, warnings as errors) that runs
+  the CPU tests; a CPU-only build with FMA instructions enabled
+  (`-march=x86-64-v3`) that runs all tests; and a CPU-only Debug build with
+  AddressSanitizer and UndefinedBehaviorSanitizer. GitHub-hosted runners have
+  no GPU, so no kernel is executed in CI: the badge says nothing about GPU
+  correctness. The GPU tests are built in CI and run locally.
 
 ## Building and running
 
@@ -117,11 +240,16 @@ since it writes CSV files to `output/`):
 
 CMake options:
 
+- `LBM_ENABLE_CUDA` (default ON): build the CUDA code. With `OFF` the CPU
+  reference and the CPU tests build without nvcc; the GPU tests and the
+  applications are skipped. With `ON` and no CUDA compiler, configuration
+  fails.
 - `LBM_BUILD_TESTS` (default ON): build the unit tests (fetches GoogleTest
-  v1.18.0)
-- `LBM_BUILD_APPS` (default ON): build the applications
+  v1.18.0, pinned by SHA-256 hash)
+- `LBM_BUILD_APPS` (default ON): build the applications (needs CUDA)
 - `LBM_WARNINGS_AS_ERRORS` (default OFF): treat warnings as errors; enabled in
-  CI
+  CI. C++ code is compiled with `-Wall -Wextra -Wpedantic`; CUDA sources get
+  `-Wall -Wextra` on the host pass (no `-Wpedantic`).
 
 ## Repository structure
 
@@ -131,22 +259,35 @@ CMake options:
   - `propagation/`: fused pull stream-collide node function
   - `cpu/`: CPU reference step
   - `cuda/`: CUDA step kernel, device buffer, error checking
-  - `grid.hpp`, `equilibrium.hpp`, `moments.hpp`, `force.hpp`, `config.hpp`:
-    grid and node types, equilibrium, moments, body force, portability macros
+  - `boundary/`: empty placeholder (halfway bounce-back is inside the node
+    function)
+  - `grid.hpp`, `equilibrium.hpp`, `moments.hpp`, `force.hpp`, `storage.hpp`,
+    `config.hpp`: grid and node types, equilibrium, moments, body force,
+    storage conversion and the P16 format, portability macros
 - `tests/`: GoogleTest unit tests; `tests/gpu/` holds the GPU tests;
+  `tests/support/` holds the shared error bounds, fields and reference code;
   `device_compile_check.cu` is a compile-only check of the device code
 - `apps/poiseuille/`: Poiseuille measurement application
+- `apps/benchmark/`: GPU step benchmark
 - `scripts/`: plotting script for the validation figure
 - `docs/`: design decisions (`DESIGN.md`) and figures (`images/`)
 - `.github/workflows/`: CI workflow
+- `src/cpu/`, `src/cuda/`, `validation/`: empty placeholders
 
 ## Roadmap
 
 - Moving walls and the lid-driven cavity (Ghia et al.)
-- Velocity and pressure boundaries and flow past a cylinder at $\mathrm{Re} = 100$
-- D3Q19
-- Performance measurement and optimization
-- FP16 storage
+- Open boundaries (velocity and pressure) and flow past a cylinder at
+  $\mathrm{Re} = 100$
+- D3Q19, with 3D counterparts of the grid, the node function and the kernels
+- Single-buffer propagation (AA pattern or esoteric pull): halves the
+  population memory; no speed-up is expected on this GPU
+- CUDA graphs (or a multi-step kernel) for launch-bound grids
+- A hardware binary16 conversion for P16, to cut its instruction count (this
+  means the binary16 layout, which was the less accurate of the two formats
+  compared)
+- Dropping the $c = 0$ terms in the generic loops, to reduce the FP64
+  instruction count
 - Bounded CPU-vs-GPU comparison with FMA enabled
 
 ## References
