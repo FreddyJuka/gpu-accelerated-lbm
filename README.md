@@ -18,7 +18,7 @@ Implemented and verified:
 - D2Q9 lattice
 - Shifted equilibrium and moments
 - TRT collision with validated parameters (runtime magic parameter $\Lambda$)
-- Guo body force, split for TRT, with a uniform force policy
+- Guo body force (Guo et al. 2002), split for TRT, with a uniform force policy
 - Halfway bounce-back walls, selected through per-node flags
 - Periodic domains
 - Fused pull stream-collide with two buffers, on CPU and GPU, sharing one node
@@ -44,9 +44,10 @@ Not done yet: see the [Roadmap](#roadmap).
 ## Design highlights
 
 - Lattice-generic templates for the collision-side code (D2Q9 now, D3Q19
-  planned): [DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)
+  planned; no second lattice exists, so the genericity is by construction and
+  untested): [DESIGN.md, section 1](docs/DESIGN.md#1-scope-and-lattice)
 - `<Storage, Compute>` precision templates with shifted populations
-  (DDF-shifting) and a conversion trait:
+  (DDF-shifting, Lehmann et al. 2022) and a conversion trait:
   [section 3](docs/DESIGN.md#3-numerical-precision)
 - Structure-of-arrays layout with $x$ as the fastest index:
   [section 4](docs/DESIGN.md#4-memory-layout-soa)
@@ -71,16 +72,17 @@ Not done yet: see the [Roadmap](#roadmap).
 
 Bytes per node update is `2 * 9 * sizeof(Storage) + 1` (two buffers of nine
 populations plus one flag byte). P16 is a 16-bit format with 1 sign, 4
-exponent and 11 mantissa bits, range up to $2 - 2^{-10}$, rounding to nearest
+exponent and 11 mantissa bits (the layout studied as FP16C by Lehmann et
+al. 2022), range up to $2 - 2^{-10}$, rounding to nearest
 (ties to even) and an invalid pattern (NaN) on overflow. It halves the
 population memory (8192 x 8192 fits in 4 GB; float storage stops at
-4096 x 4096) and is 1.29x faster than float/float on large grids when the GPU
+4096 x 4096) and is 1.28 to 1.29x faster than float/float on large grids when the GPU
 is thermally limited (1.46x on a cool GPU), not the 1.97x of the traffic ratio,
 because the integer conversion makes the kernel instruction-bound. Its main
 limitation is accuracy: a force-driven flow started from rest stalls at a fixed
 point of the rounded scheme short of the steady state, with an error that
-scales as $c \, 2^{-12} \tfrac{H^2}{\nu}$ ($c$ between 0.012 and 0.033 in the measured
-cases). Details: [DESIGN.md, section 3](docs/DESIGN.md#3-numerical-precision).
+scales as $c \cdot 2^{-12} \tfrac{H^2}{\nu}$ (an empirical fit over the 20 of 24 measured
+cases that do not saturate, with $c$ between 0.012 and 0.033). Details: [DESIGN.md, section 3](docs/DESIGN.md#3-numerical-precision).
 
 ## Validation: Poiseuille flow
 
@@ -90,7 +92,7 @@ halfway bounce-back the steady solution is the analytical parabola shifted by
 a uniform slip
 
 $$
-\Delta u = \frac{F_x}{2\nu}\,\frac{16\Lambda - 3}{12},
+\Delta u = \frac{F_x}{2\nu} \cdot \frac{16\Lambda - 3}{12},
 $$
 
 (Ginzburg, Verhaeghe, d'Humieres 2008, Eq. (2.29) and Table 1), which vanishes
@@ -99,7 +101,7 @@ at $\Lambda = \tfrac{3}{16}$.
 Measured with `apps/poiseuille` in double precision on the GPU, for
 $\Lambda = \tfrac{3}{16}$ and $\Lambda = \tfrac{1}{4}$, $H = 8, 16, 32, 64$ and $\nu = 0.01, \tfrac{1}{6}, 0.5$: the
 numerical profile equals the parabola plus $\Delta u$ at round-off level (residual at
-most $2.7\times10^{-12}\,u_{\max}$, see [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow)
+most $2.7\times10^{-12} u_{\max}$, see [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow)
 for details and caveats). $\Lambda = \tfrac{1}{12}$ is covered by the tests.
 
 ![Poiseuille profiles, deviation from the parabola and residual against the slip formula](docs/images/poiseuille.png)
@@ -112,11 +114,11 @@ What each precision is validated for:
 
 - **Double:** all test cases ($H = 8, 16$; $\nu = \tfrac{1}{6}, \tfrac{1}{2}$;
   $\Lambda = \tfrac{3}{16}, \tfrac{1}{4}, \tfrac{1}{12}$), CPU and GPU.
-- **Float:** only the cases in which the derived tolerance is below the slip
-  ($H = 8$ with both viscosities, $H = 16$ with $\nu = \tfrac{1}{2}$), CPU and GPU. In
-  the wider and less viscous channels the derived float tolerance is not below
-  the slip, so those cases would not validate the slip formula and are not in
-  the float tests. Measured with the app (`--compute float`), the float error
+- **Float:** $H = 8$ with both viscosities and $H = 16$ with
+  $\nu = \tfrac{1}{2}$, CPU and GPU. At $H = 16$ with $\nu = \tfrac{1}{6}$ the derived
+  float tolerance is 0.9 to 1.3 times the slip, so that pair is left out as a
+  whole, and the wider and less viscous channels are not validated in float.
+  Measured with the app (`--compute float`), the float error
   is below the slip in 10 of the 12 cases with $\Lambda = \tfrac{1}{4}$, but not at
   $\nu = 0.01$ with $H = 32$ and $H = 64$.
 - **P16:** 12 cases per backend with weaker claims: the slip is claimed to be
@@ -124,11 +126,19 @@ What each precision is validated for:
   $u_x$, $u_y$ and $\rho$ within the derived bounds without claiming to resolve
   the slip, and check that the tolerance is below the smallest reference
   velocity in the channel.
+- **Float storage with double compute:** not validated on a flow. It is
+  tested for the conversion, the composition of the step and bitwise
+  CPU-vs-GPU equality only.
 
 The Poiseuille tolerance rests on a stated physical assumption, the decay rate
 of the slowest hydrodynamic mode of the channel, and is not a proven bound.
-Only the mean-density part is a proven bound: it follows from accumulating the
-per-step mass error of the collision over the steps run. Details in
+The mean-density part rests on a sound argument (streaming and bounce-back are
+exact permutations, the collision conserves mass, the per-step errors
+accumulate linearly), but it is not a fully proven bound as implemented: the
+per-step mass bound is sampled every 1000 steps and assumed to bound the steps
+in between (monotone approach of the velocity), and its derivation counts the
+roundings of unfused arithmetic, while the GPU Poiseuille target keeps FMA
+contraction. Details in
 [DESIGN.md, section 12](docs/DESIGN.md#12-validation-poiseuille-flow).
 
 The app options `--compute double|float` and `--storage same|float|p16` make
@@ -137,8 +147,10 @@ the float and P16 measurements reproducible:
     ./build/apps/lbm_poiseuille --compute float
     ./build/apps/lbm_poiseuille --compute float --storage p16
 
-To regenerate the figure (requires the CSV files written by `lbm_poiseuille`
-into `output/`, see below):
+To regenerate the figure (requires the CSV files written by the default
+double/double run of `lbm_poiseuille` into `output/`, see below; a float or
+P16 run writes the same file names and overwrites them, so run the default
+configuration last):
 
     python3 -m venv .venv
     .venv/bin/pip install -r scripts/requirements.txt
@@ -167,10 +179,12 @@ repetitions, GPU cool at the start:
   cannot go faster without moving fewer bytes.
 - Double is bound by the FP64 pipe of this GPU (1/64 of the FP32 rate), not by
   memory.
-- Small grids (float up to 256 x 256) are bound by the kernel launch cost
-  under WSL2 (about 10 us per launch).
-- P16 speed-up over float/float on large grids: 1.29x unforced and 1.14x forced
-  with the GPU thermally limited (4096 x 4096), 1.46x and 1.31x on a cool GPU.
+- Float at 128 x 128 is limited by the launch path under WSL2 (about 8 to 9 us
+  per step in the AC session; a launch cost of 9.5 to 10.4 us was measured in
+  the earlier, lower-power state). 256 x 256 and 512 x 512 reach 75 to 89 % of
+  the copy bandwidth.
+- P16 speed-up over float/float on large grids: 1.28 to 1.29x unforced and
+  1.13 to 1.14x forced with the GPU thermally limited (4096 x 4096), 1.46x and 1.31x on a cool GPU.
 - Nsight Compute counters cannot be collected on this machine, so the
   bound-by statements come from instruction counts and rooflines, not from
   hardware counters.
@@ -211,7 +225,7 @@ conditions are given in the DESIGN section. To reproduce:
   tolerance derivation is not argued separately for fused arithmetic).
 - CI has three jobs: a CUDA build (all targets, warnings as errors) that runs
   the CPU tests; a CPU-only build with FMA instructions enabled
-  (`-march=x86-64-v3`) that runs all tests; and a CPU-only Debug build with
+  (`-march=x86-64-v3`) that runs all tests (the 151 CPU tests); and a CPU-only Debug build with
   AddressSanitizer and UndefinedBehaviorSanitizer. GitHub-hosted runners have
   no GPU, so no kernel is executed in CI: the badge says nothing about GPU
   correctness. The GPU tests are built in CI and run locally.
@@ -249,7 +263,8 @@ CMake options:
 - `LBM_BUILD_APPS` (default ON): build the applications (needs CUDA)
 - `LBM_WARNINGS_AS_ERRORS` (default OFF): treat warnings as errors; enabled in
   CI. C++ code is compiled with `-Wall -Wextra -Wpedantic`; CUDA sources get
-  `-Wall -Wextra` on the host pass (no `-Wpedantic`).
+  `-Wall -Wextra` on the host pass (no `-Wpedantic`). The reason for the
+  missing `-Wpedantic` there was never evaluated.
 
 ## Repository structure
 
@@ -266,7 +281,8 @@ CMake options:
     storage conversion and the P16 format, portability macros
 - `tests/`: GoogleTest unit tests; `tests/gpu/` holds the GPU tests;
   `tests/support/` holds the shared error bounds, fields and reference code;
-  `device_compile_check.cu` is a compile-only check of the device code
+  `poiseuille_common.hpp` is the code shared by the CPU and GPU Poiseuille
+  tests; `device_compile_check.cu` is a compile-only check of the device code
 - `apps/poiseuille/`: Poiseuille measurement application
 - `apps/benchmark/`: GPU step benchmark
 - `scripts/`: plotting script for the validation figure
@@ -280,7 +296,7 @@ CMake options:
 - Open boundaries (velocity and pressure) and flow past a cylinder at
   $\mathrm{Re} = 100$
 - D3Q19, with 3D counterparts of the grid, the node function and the kernels
-- Single-buffer propagation (AA pattern or esoteric pull): halves the
+- Single-buffer propagation (AA pattern, Bailey et al. 2009, or esoteric pull): halves the
   population memory; no speed-up is expected on this GPU
 - CUDA graphs (or a multi-step kernel) for launch-bound grids
 - A hardware binary16 conversion for P16, to cut its instruction count (this

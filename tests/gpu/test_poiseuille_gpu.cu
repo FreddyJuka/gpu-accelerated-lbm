@@ -1,7 +1,7 @@
 // Poiseuille validation on the GPU: same cases, checks and bounds as
 // test_poiseuille.cpp (see poiseuille_common.hpp). This target keeps nvcc's
-// default FMA contraction (production flags); the tolerance derivation holds
-// for fused and unfused arithmetic alike.
+// default FMA contraction (production flags). That the tolerance derivation
+// also holds for fused arithmetic is asserted, not argued.
 
 #include <gtest/gtest.h>
 

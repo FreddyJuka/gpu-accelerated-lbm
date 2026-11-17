@@ -162,7 +162,8 @@ struct StorageConversion<float, double> {
 //
 // The invalid pattern (0x7FFF, 0xFFFF) loads as a quiet NaN. The format has no
 // infinities. Overflow is deliberately not saturated: a population outside
-// (-2, 2) is a failed simulation (negative f_q or rho > 4), and a NaN spreads
+// (-2, 2) is a failed simulation (negative f_q, or a rest population above 2,
+// i.e. rho > 5.5 at rest), and a NaN spreads
 // through the following collisions and is seen, whereas a clamped value would
 // continue as a plausible number. This is what float storage does as well
 // (overflow -> inf -> NaN in the next collision).

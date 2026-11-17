@@ -24,15 +24,16 @@ and the reasoning for each one. It is updated whenever a decision changes.
 ## 1. Scope and lattice
 
 The solver starts in 2D with D2Q9 to reach a validated baseline quickly
-(Poiseuille now; lid-driven cavity and cylinder at Re = 100 are on the
-roadmap). The lattice (velocity set, weights, opposite-direction table, Q, D)
+(Poiseuille now; lid-driven cavity, Ghia et al. 1982, and cylinder at
+Re = 100 are on the roadmap). The lattice (velocity set, weights, opposite-direction table, Q, D)
 is a template parameter.
 
 What is lattice-generic and what is not:
 
 - Generic: shifted equilibrium, moments, the Guo source, the TRT collision.
   They use only `L::D`, `L::Q`, `L::c(q, d)`, `L::opp(q)`, `L::w<T>(q)`,
-  `L::cs2<T>()` and `L::inv_cs2<T>()`.
+  `L::cs2<T>()` and `L::inv_cs2<T>()`. No second lattice exists, so this
+  genericity is by reading the code and is untested.
 - 2D only: `Grid2D` (it has a `static_assert(L::D == 2)`), the node function
   `pull_stream_collide` (it takes `Grid2D` and `(x, y)`), `step_cpu`,
   `step_kernel` and the launch configuration. D3Q19 needs 3D counterparts of
@@ -83,7 +84,7 @@ Implemented combinations:
 |---|---|---|---|
 | double | double | identity | reference for validation and convergence studies |
 | float | float | identity | default performance configuration |
-| float | double | exact widening / one IEEE rounding (mixed precision) | implemented and tested |
+| float | double | exact widening / one IEEE rounding (mixed precision) | implemented; tested for conversion, step composition and CPU-vs-GPU equality, not validated on a flow |
 | P16 | float | exact / round to nearest, integer operations | experimental |
 
 Any other pair is rejected at compile time (`static_assert` on `supported`);
@@ -160,16 +161,20 @@ has the conditions):
 
 P16 reaches 65 % (unforced) and 58 % (forced) of the copy-kernel bandwidth at
 4096^2, against 100 % for float. The reason is instruction count, not traffic:
-the P16 step executes 753 SASS instructions per node unforced (833 forced)
-against 371 (451) for float, because the conversion is integer bit
-manipulation (21 instructions per conversion, 18 conversions per node). The
+the P16 step executes about 753 SASS instructions per node unforced (833
+forced) against about 371 (451) for float, because the conversion is integer
+bit manipulation (about 21 instructions per conversion, 18 conversions per
+node). The counts depend on how instructions are counted: a plain count of
+non-NOP SASS lines of the same kernels in a fresh build gives 375 / 451 for
+float and 774 / 851 for P16 (about 22 per conversion). Either way the
+conversion roughly doubles the instruction count. The
 product MLUPS x instructions per node is the same for the unforced and the
 forced kernel (2.76e12 and 2.74e12 instructions per second on the cool GPU),
 which is the signature of an instruction-bound kernel; this is inferred from
 instruction counts, since hardware counters are not available (section 13). At
 that rate the traffic ratio would need about 10 instructions per conversion
-instead of 21. On small grids P16 is slower than float (128^2: 0.77 to 0.83,
-launch-bound); the first run, from which this comes, was disturbed and is
+instead of about 21 to 22. On small grids P16 is slower than float (128^2: 0.77 to 0.83,
+where the launch path limits); the first run, from which this comes, was disturbed and is
 indicative only.
 
 **Accuracy limitation.** A force-driven flow started from rest does not reach
@@ -201,7 +206,7 @@ repository, so the result cannot be reproduced from it.
 Populations are stored as one contiguous array per direction:
 
     idx(q, x, y)    = q * N + y * nx + x,              N = nx * ny
-    idx(q, x, y, z) = q * N + (z * ny + y) * nx + x,   N = nx * ny * nz
+    idx(q, x, y, z) = q * N + (z * ny + y) * nx + x,   N = nx * ny * nz   (3D, planned)
 
 Consecutive threads map to consecutive x, so global memory accesses are
 coalesced.
@@ -221,11 +226,11 @@ Memory cost (populations only, both buffers):
 | Lattice | FP32 (also float storage with double compute) | FP64 | 16-bit (P16) |
 |---|---|---|---|
 | D2Q9 | 72 B/node | 144 B/node | 36 B/node |
-| D3Q19 | 152 B/node | 304 B/node | 76 B/node |
+| D3Q19 (planned) | 152 B/node | 304 B/node | 76 B/node |
 
 There is no propagation interface: the CPU step and the CUDA kernel call the
 node function `pull_stream_collide` directly. A single-buffer scheme
-(AA-pattern, esoteric pull) would halve the population memory but changes the
+(AA-pattern, Bailey et al. 2009; esoteric pull) would halve the population memory but changes the
 data-layout contract of the step (post-collision populations in the source
 buffer, which the Poiseuille measurement relies on), so it needs a new node
 function. On this GPU no speed-up is expected from it: float is already at the
@@ -270,8 +275,8 @@ CI (`.github/workflows/ci.yml`, `ubuntu-24.04`) has three jobs:
 | Job | Configuration | Runs |
 |---|---|---|
 | `cuda` | Release, `LBM_WARNINGS_AS_ERRORS=ON`, `LBM_ENABLE_CUDA=ON`, sm_86; nvcc 12.0 from the Ubuntu package `nvidia-cuda-toolkit` | builds everything, including the GPU tests; `ctest -LE gpu` |
-| `cpu-fma` | Release, `LBM_ENABLE_CUDA=OFF`, `LBM_WARNINGS_AS_ERRORS=ON`, `-march=x86-64-v3` | all tests, with FMA instructions available to the compiler |
-| `cpu-sanitizers` | Debug, `LBM_ENABLE_CUDA=OFF`, `-fsanitize=address,undefined`, `UBSAN_OPTIONS=halt_on_error=1` | all tests |
+| `cpu-fma` | Release, `LBM_ENABLE_CUDA=OFF`, `LBM_WARNINGS_AS_ERRORS=ON`, `-march=x86-64-v3` | all tests (the 151 CPU tests), with FMA instructions available to the compiler |
+| `cpu-sanitizers` | Debug, `LBM_ENABLE_CUDA=OFF`, `-fsanitize=address,undefined`, `UBSAN_OPTIONS=halt_on_error=1` | all tests (the 151 CPU tests) |
 
 GitHub-hosted runners have no GPU, so no kernel is executed in CI: the badge
 covers the CUDA compilation and the CPU tests, not GPU execution. Discovery of
@@ -282,7 +287,8 @@ Build configuration: `LBM_ENABLE_CUDA` (default ON) makes the CPU reference and
 its tests buildable without nvcc; with it ON and no CUDA compiler,
 configuration fails instead of falling back. GoogleTest v1.18.0 is fetched with
 a pinned SHA-256 hash. C++ sources are compiled with `-Wall -Wextra -Wpedantic`;
-the host pass of CUDA sources gets `-Wall -Wextra` only.
+the host pass of CUDA sources gets `-Wall -Wextra` only. The reason for the
+missing `-Wpedantic` on the CUDA host pass was never evaluated.
 
 ## 7. Lattice constants in host and device code
 
@@ -307,7 +313,8 @@ conversions, for float and double and for the mixed and P16 combinations), and
     cuobjdump -res-usage build/tests/CMakeFiles/lbm_device_compile_check.dir/device_compile_check.cu.o
 
 report 0 LDL/STL instructions and `STACK:0 LOCAL:0` for every kernel of the
-Release build, with 39 to 64 registers per thread. The pull-step kernels of the
+Release build, with 10 to 64 registers per thread (39 to 64 for the pull-step
+kernels). The pull-step kernels of the
 performance report use 40 registers (float; 46 unforced and 62 forced for
 double after the flattened mapping).
 
@@ -321,8 +328,9 @@ not sufficient because it is defined in both passes.
 Indices are 32-bit `int`. `Grid2D` validates in its constructor, in 64-bit
 arithmetic, that `Q*N <= INT32_MAX` (N = nx*ny), so no index computed by
 `idx()` can overflow. With 4 GB of VRAM the limit cannot be reached: FP32 with
-two buffers holds at most ~5e8 population values, below the 2^31 - 1 ~ 2.1e9
-limit.
+two buffers holds at most ~5e8 population values per buffer, below the
+2^31 - 1 ~ 2.1e9 limit. With P16 storage one buffer holds at most about 1.07e9
+values, still below the limit but with half the margin.
 
 Node types are stored as a `uint8_t` flag array (`NodeType`), ~1 B per node
 versus 72 B of FP32 populations per node (D2Q9).
@@ -361,11 +369,15 @@ LDL/STL, and is 6 % slower). The block size stays 128 (full theoretical
 occupancy for 40-register kernels).
 
 There is no limit on ny: the grid is one-dimensional, and the only size limit
-is that of `Grid2D`, `Q*nx*ny <= INT32_MAX`, which gives at most 2^24 blocks.
+is that of `Grid2D`, `Q*nx*ny <= INT32_MAX`, which gives at most about 1.9
+million blocks of 128 threads (N <= INT32_MAX / 9).
 (An earlier version rejected ny above 65535, the CUDA limit of the y grid
 dimension; `StepGpu.TallNarrowGridsMatchCpu` now checks such grids.) The
 launcher throws `std::invalid_argument` for null pointers (flags included) and
-for `src == dst`, and `std::runtime_error` if the launch fails. Device memory
+for `src == dst`, and `std::runtime_error` if the launch fails. It cannot check buffer sizes or
+partial overlap of `src` and `dst`: both step functions take raw pointers
+without a count, and the caller sizes the buffers (`Q * N` populations, `N`
+flags) from the same grid. Device memory
 is owned by a move-only RAII buffer (`DeviceBuffer`), and CUDA errors are
 raised as exceptions (`LBM_CUDA_CHECK`). The CPU reference and the GPU kernel
 share the same node function (`pull_stream_collide`), so they perform the same
@@ -463,13 +475,16 @@ u_x against `u_a + du`, and u_y and drho against zero. They run in three
 precisions, with these scopes:
 
 - double/double: all 12 cases;
-- float/float: only the cases whose derived tolerance is below the slip, i.e.
-  H = 8 with both viscosities and H = 16 with nu = 0.5 (9 cases). The
-  derived tolerance grows as eps (H + 1)^2 / nu while the slip decreases as
-  1/H^2; at H = 16 with nu = 1/6 it is about the slip itself, so such a case
-  could not validate the slip formula. The restriction follows from the derived
-  tolerance, not from the measured errors, and the same assertion as in double
-  (`|du| > tol_x`) fails a float case that stops resolving the slip;
+- float/float: H = 8 with both viscosities and H = 16 with nu = 0.5 (9
+  cases; `float_cases()` selects by `H == 8 || nu == 0.5`). The derived
+  tolerance grows as eps (H + 1)^2 / nu while the slip decreases as 1/H^2; at
+  H = 16 with nu = 1/6 it is 0.9 to 1.3 times the slip (0.92 times for
+  Lambda = 1/12, which would pass its assertions, 1.33 times for
+  Lambda = 1/4, which would fail), so that pair is left out as a whole, and
+  wider or less viscous channels are not validated in float. The restriction
+  follows from the derived tolerance, not from the measured errors, and the
+  same assertion as in double (`|du| > tol_x`) fails a float case that stops
+  resolving the slip;
 - P16/float: all 12 cases, with weaker claims. The tolerance contains the
   rounding of the 16-bit store (each step moves a population by at most
   2^-12 |s|, or 2^-26 below the normal range) and is 0.4 % to 4.5 % of u_max.
@@ -481,9 +496,12 @@ precisions, with these scopes:
   below the smallest reference velocity in the channel, so that a stalled or
   grossly wrong profile fails. The measured P16 errors (section 3.2) are
   larger than the slip in most cases; the tests do not cover wider channels or
-  nu = 0.01 for P16. The reference uses the nu and Lambda effectively
-stored in the collision object, which are asserted to agree with the nominal
-values within their derived rounding bounds. The tolerance is
+  nu = 0.01 for P16.
+
+The tolerance, common to the three precisions, is built as follows. The
+reference uses the nu and Lambda effectively stored in the collision object,
+which are asserted to agree with the nominal values within their derived
+rounding bounds. The tolerance is
 `delta_step/(1 - r) + residual_stop + ref_round`: `delta_step` is the round-off
 one step introduces, from operation counts (the mass and momentum bounds of the
 force tests, evaluated on the gathered populations of every node at every
@@ -492,23 +510,36 @@ check); `r` is the decay factor per step of the slowest diffusive mode,
 measured final change over the last K = 1000 steps; `ref_round` is the
 rounding of the long double reference. The tolerance is therefore an
 estimate resting on a stated physical assumption, not a proven upper bound.
-The assumption is
+The assumptions are
 stated explicitly: `r` is a physical estimate of the slowest hydrodynamic
 mode, not a proven contraction bound for the full (non-normal) LBM operator;
 the tolerance also assumes that round-off enters through the conserved
 moments with the bounds above, that the same `r` applies to u_y and drho, and
-that the exact-arithmetic steady state is `u_a + du`, u_y = 0, drho = 0. The
-GPU test target keeps nvcc's default FMA contraction; that the derivation also
+that the exact-arithmetic steady state is `u_a + du`, u_y = 0, drho = 0. Two
+further assumptions are in the code comments but were not listed here: the
+per-step bound is evaluated at the checks, every 1000 steps, and relies on
+the velocity approaching its steady value monotonically from rest, so that
+the sampled magnitudes bound those in between; and `residual_stop` assumes
+that the final change decays geometrically, although in double that change is
+at round-off level (in float and P16 the final change is exactly 0 and the
+term vanishes). The GPU test target keeps nvcc's default FMA contraction; that the derivation also
 holds for fused arithmetic is asserted in the test comments, not argued.
 
-The one proven part is the mean of drho: streaming and bounce-back permute
-populations (exact in floating point) and the collision conserves mass in
-exact arithmetic, so the mean density can change only by the per-step
-round-off of the collision, which accumulates linearly (`n` steps times the
-per-node mass bound, plus the rounding of the measurement). That bound needs no
-physical assumption (it is loose: with P16 storage it is about 3.5e-3 against a
-measured drift of 3e-7 to 1.4e-5). The fluctuation of drho around the mean
-uses the decay assumption.
+The mean of drho has a sound argument that does not use the decay rate:
+streaming and bounce-back permute populations (exact in floating point) and
+the collision conserves mass in exact arithmetic, so the mean density can
+change only by the per-step round-off of the collision, which accumulates
+linearly (`n` steps times the per-node mass bound, plus the rounding of the
+measurement). As implemented it is not a fully proven bound, for two reasons.
+The per-node mass bound is evaluated at the checks, every 1000 steps, and the
+maximum is used for all steps, which relies on the monotone approach assumed
+above. And its derivation (`ForceCollide.ConservesMassAndMomentumChangeIsF`)
+counts one rounding per source operation and uses bitwise symmetry of the
+rounded relaxation terms, which is a statement about unfused arithmetic, while
+the GPU Poiseuille target keeps FMA contraction. It is therefore a bound for
+the CPU run in unfused arithmetic given the sampling assumption. It is loose:
+with P16 storage it is about 3.5e-3 against a measured drift of 3e-7 to
+1.4e-5. The fluctuation of drho around the mean uses the decay assumption.
 
 The app takes `--compute double|float` and `--storage same|float|p16`
 (`--storage p16` requires float compute); the default is double/double, the
@@ -631,21 +662,24 @@ Reading:
   function has 164 FP64 instructions per node unforced and 237 forced (SASS),
   and the measured rate was 87 to 89 % of the pipe limit computed from these
   counts at the SM clock observed (first study, section 13.2; the remainder is
-  the reciprocal, compares and integer work). The forced/unforced ratio of 1.45 equals the instruction
-  ratio 237 / 164.
+  the reciprocal, compares and integer work). The forced/unforced ratio is 1.47
+  to 1.49 (237 / 354 MLUPS in the table above is 1.49), close to the
+  instruction ratio 237 / 164 = 1.45.
 - **Float storage with double compute** is slower than double/double at the
   same grid (316 against 354 MLUPS unforced); the reports do not analyse why.
 - **P16 / float** is instruction-bound (section 3.2): 1.28 to 1.29 times float
   unforced and 1.13 to 1.14 forced at 4096^2 when thermally limited, 1.46 and
   1.31 on the cool GPU, against 1.97 from traffic alone. Its benefit on this GPU
   is capacity (8192^2).
-- **Small grids** are bound by the cost of a kernel launch under WSL2,
-  measured at 9.5 to 10.4 us per launch of an empty kernel (0.02 us for
-  `cudaGetDevice` or `cudaDeviceGetAttribute`). A float kernel on a grid up to
-  256 x 256 is shorter than that. In the first AC run, which was
-  disturbed and is indicative only, float reached 1900 to 1984 MLUPS at
-  128^2 and 1913 to 2224 MLUPS at 256^2 and 512^2 (75 to 88 % of copy);
-  P16 was slower than float at 128^2 and ahead from 512^2 on.
+- **Small grids.** Float at 128^2 is limited by the launch path under WSL2:
+  1900 to 1984 MLUPS is 8.3 to 8.6 us per step. A launch cost of 9.5 to
+  10.4 us (empty kernel; 0.02 us for `cudaGetDevice` or
+  `cudaDeviceGetAttribute`) was measured in the first study, in its lower
+  power state, so the two figures are from different states. At 256^2 and
+  512^2 float is not launch-bound: 1913 to 2224 MLUPS, 75 to 89 % of the copy
+  bandwidth. These numbers are from the first AC run, which was disturbed and
+  is indicative only. P16 was slower than float at 128^2 and ahead from 512^2
+  on.
 - **Narrow grids**: see section 9 for the effect of the thread mapping.
 
 ### 13.4 Reproduction
@@ -667,8 +701,8 @@ arithmetic and needs a design decision (estimates from the performance study,
 not measurements):
 
 - CUDA graphs or a multi-step kernel for launch-bound grids (a stepper object
-  instead of a free function); expected to help grids below 512^2, not larger
-  ones.
+  instead of a free function); expected to help grids whose kernel is shorter
+  than the launch path (float 128^2), not grids of 512^2 and larger.
 - Dropping the c = 0 terms in the generic loops (6 of the 18 (q, d) pairs
   after unrolling): 164 to 152 FP64 instructions unforced, 237 to 213 forced,
   expected 7 % and 10 % for double; bitwise identical for finite inputs but
@@ -677,7 +711,8 @@ not measurements):
 - A hardware binary16 conversion for P16: it would cut the instruction count
   but means the binary16 layout, the less accurate of the two formats compared
   (section 3.2).
-- Single-buffer propagation (section 5): memory, not speed.
+- Single-buffer propagation (section 5; AA pattern, Bailey et al. 2009):
+  memory, not speed.
 
 ## References
 

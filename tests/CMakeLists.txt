@@ -52,7 +52,8 @@ if(LBM_ENABLE_CUDA)
   gtest_discover_tests(lbm_gpu_tests PROPERTIES LABELS gpu)
 
   # GPU Poiseuille validation. Unlike lbm_gpu_tests it keeps nvcc's default FMA
-  # contraction (production flags); the tolerance holds either way.
+  # contraction (production flags). That the tolerance also holds for fused
+  # arithmetic is asserted, not argued.
   add_executable(lbm_poiseuille_gpu_tests gpu/test_poiseuille_gpu.cu)
   target_link_libraries(lbm_poiseuille_gpu_tests PRIVATE
     lbm::lbm
