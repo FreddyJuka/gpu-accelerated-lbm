@@ -8,6 +8,13 @@ name: GPU Simulator
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
   pull_request:
     paths:
       - "include/**"
@@ -58,24 +65,30 @@ jobs:
 
       # The exact CPU-vs-GPU comparison (all EXPECT_EQ on the raw bits), run in
       # full. The simulator can print a VirtualGPU error and still exit 0, and
-      # the GPU tests must not be skipped, so the output is checked too.
+      # the GPU tests must not be skipped, so the output is checked too. The
+      # expected number of tests is taken from --gtest_list_tests (run the same
+      # way as the tests) and the reported number of passed tests must match it.
       - name: Test CPU-vs-GPU step
         run: |
           set -o pipefail
+          vgpu run ./build/tests/lbm_gpu_tests --gtest_list_tests 2>&1 | tee step_list.log
+          if grep -i -E "VirtualGPU error|no CUDA-capable device|no device" step_list.log; then exit 1; fi
+          expected=$(grep -c -E "^  [A-Za-z0-9_]" step_list.log)
+          test "$expected" -gt 0
           vgpu run ./build/tests/lbm_gpu_tests 2>&1 | tee step.log
-          ! grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" step.log
-          grep -F "[       OK ] StepGpuP16.ConversionMatchesHostBitwise" step.log
-          grep -F "[       OK ] StepGpu/1.HundredStepsForcedMatchesCpu" step.log
-          grep -E "\[  PASSED  \] [0-9]+ tests" step.log
+          if grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" step.log; then exit 1; fi
+          grep -E "^\[  PASSED  \] ${expected} tests?\.$" step.log
 
       # The GPU Poiseuille validation (double, float and 16-bit storage), all
       # cases, against the analytic profile within the derived tolerances.
+      # Checked like the previous step.
       - name: Test GPU Poiseuille
         run: |
           set -o pipefail
+          vgpu run ./build/tests/lbm_poiseuille_gpu_tests --gtest_list_tests 2>&1 | tee poiseuille_list.log
+          if grep -i -E "VirtualGPU error|no CUDA-capable device|no device" poiseuille_list.log; then exit 1; fi
+          expected=$(grep -c -E "^  [A-Za-z0-9_]" poiseuille_list.log)
+          test "$expected" -gt 0
           vgpu run ./build/tests/lbm_poiseuille_gpu_tests 2>&1 | tee poiseuille.log
-          ! grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" poiseuille.log
-          grep -F "[       OK ] Channel/PoiseuilleGpu.MatchesShiftedParabola/H16_nu0_5_lambda0_1875" poiseuille.log
-          grep -F "[       OK ] Channel/PoiseuilleGpuFloat.MatchesShiftedParabola/H8_nu0_5_lambda0_1875" poiseuille.log
-          grep -F "[       OK ] Channel/PoiseuilleGpuP16.MatchesShiftedParabola/H8_nu0_5_lambda0_1875" poiseuille.log
-          grep -E "\[  PASSED  \] 33 tests" poiseuille.log
+          if grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" poiseuille.log; then exit 1; fi
+          grep -E "^\[  PASSED  \] ${expected} tests?\.$" poiseuille.log

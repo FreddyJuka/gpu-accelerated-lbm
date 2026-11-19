@@ -283,6 +283,18 @@ covers the CUDA compilation and the CPU tests, not GPU execution. Discovery of
 the GPU tests needs no GPU (checked with `CUDA_VISIBLE_DEVICES=""`), so the
 full build succeeds on the runner. The GPU tests are run locally.
 
+An optional workflow (`.github/workflows/gpu-sim.yml`) builds the two GPU test
+executables (`lbm_gpu_tests`, `lbm_poiseuille_gpu_tests`) with CUDA 13.0 for
+compute_90 (PTX) and runs them on PantheonSim's simulated H100
+(https://github.com/pantheongpu/pantheonsim). It runs on manual dispatch and on
+pushes and pull requests that touch the code. For each executable the expected
+number of tests is taken from `--gtest_list_tests` and the reported number of
+passed tests must equal it; VirtualGPU errors, a missing device, skipped and
+failed tests fail the job. It checks behaviour, not performance, and uses a
+different toolchain and code path (CUDA 13.0, PTX for sm_90) than the local
+runs (CUDA 12.0, sm_86), so it complements the GPU runs on real hardware and
+does not replace them. The main CI badge still covers no GPU execution.
+
 Build configuration: `LBM_ENABLE_CUDA` (default ON) makes the CPU reference and
 its tests buildable without nvcc; with it ON and no CUDA compiler,
 configuration fails instead of falling back. GoogleTest v1.18.0 is fetched with

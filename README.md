@@ -229,6 +229,15 @@ conditions are given in the DESIGN section. To reproduce:
   AddressSanitizer and UndefinedBehaviorSanitizer. GitHub-hosted runners have
   no GPU, so no kernel is executed in CI: the badge says nothing about GPU
   correctness. The GPU tests are built in CI and run locally.
+- An optional workflow (`.github/workflows/gpu-sim.yml`) builds the two GPU
+  test executables with CUDA 13.0 for compute_90 (PTX) and runs them on
+  PantheonSim's simulated H100
+  ([pantheonsim](https://github.com/pantheongpu/pantheonsim)). It runs on
+  manual dispatch and on pushes and pull requests that touch the code. It
+  checks behaviour, not performance, and uses a different toolchain and code
+  path (CUDA 13.0, PTX for sm_90) than the local runs (CUDA 12.0, sm_86), so it
+  complements the GPU runs on real hardware and does not replace them. The
+  main CI badge still covers no GPU execution.
 
 ## Building and running
 
