@@ -281,7 +281,11 @@ CI (`.github/workflows/ci.yml`, `ubuntu-24.04`) has three jobs:
 GitHub-hosted runners have no GPU, so no kernel is executed in CI: the badge
 covers the CUDA compilation and the CPU tests, not GPU execution. Discovery of
 the GPU tests needs no GPU (checked with `CUDA_VISIBLE_DEVICES=""`), so the
-full build succeeds on the runner. The GPU tests are run locally.
+full build succeeds on the runner. The GPU tests are run locally. The `cuda` job caches the
+downloaded `.deb` files of `nvidia-cuda-toolkit` (`actions/cache`, keyed by the
+hash of the exact package versions `apt-get install -s` would install), so slow
+Ubuntu mirrors only matter on a cache miss and the toolchain is unchanged. The
+workflow can also be started manually (`workflow_dispatch`).
 
 An optional workflow (`.github/workflows/gpu-sim.yml`) builds the two GPU test
 executables (`lbm_gpu_tests`, `lbm_poiseuille_gpu_tests`) with CUDA 13.0 for

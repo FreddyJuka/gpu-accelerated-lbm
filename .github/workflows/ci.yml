@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -15,11 +16,46 @@ jobs:
 
       # nvcc is not preinstalled on the runner image; it comes from the Ubuntu
       # package (same nvcc 12.0 as the local toolchain). Retries guard against
-      # transient mirror or DNS failures.
-      - name: Install toolchain
+      # transient mirror or DNS failures. The downloaded .deb files (about
+      # 1.5 GB) are cached, so slow mirrors only matter on a cache miss. The
+      # cache key is the hash of the exact package versions apt would install,
+      # so the toolchain is the same with or without a cache hit.
+      - name: Update package index and plan the installation
         run: |
+          set -o pipefail
           sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends nvidia-cuda-toolkit
+          # "Inst <name> [<old>] (<new> <origin> [<arch>])" -> "<name>=<new>"
+          apt-get install -s -y --no-install-recommends nvidia-cuda-toolkit \
+            | awk '$1 == "Inst" { v = $0; sub(/^[^(]*\(/, "", v); sub(/ .*/, "", v); print $2 "=" v }' \
+            | sort > cuda-packages.txt
+          test -s cuda-packages.txt
+          cat cuda-packages.txt
+          wc -l cuda-packages.txt
+
+      - name: Restore cached CUDA packages
+        id: cuda-debs
+        uses: actions/cache@v6
+        with:
+          path: ~/cuda-debs
+          key: ${{ runner.os }}-ubuntu-24.04-cuda-debs-${{ hashFiles('cuda-packages.txt') }}
+
+      - name: Download CUDA packages (cache miss)
+        if: steps.cuda-debs.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends --download-only nvidia-cuda-toolkit
+          mkdir -p ~/cuda-debs
+          cp /var/cache/apt/archives/*.deb ~/cuda-debs/
+          ls ~/cuda-debs | wc -l
+          du -sh ~/cuda-debs
+
+      - name: Place cached CUDA packages (cache hit)
+        if: steps.cuda-debs.outputs.cache-hit == 'true'
+        run: |
+          ls ~/cuda-debs | wc -l
+          sudo cp ~/cuda-debs/*.deb /var/cache/apt/archives/
+
+      - name: Install toolchain
+        run: sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends nvidia-cuda-toolkit
 
       - name: Print tool versions
         run: |
