@@ -1,0 +1,81 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA tests and runs them on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements the local GPU runs
+# and does not replace them.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-tests:
+    name: GPU tests (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # 90-virtual embeds PTX only, which the simulator runs. The simulator
+      # needs a shared CUDA runtime. gtest_discover_tests normally runs the
+      # test binary right after linking, so discovery is moved to test time
+      # (the build machine has no GPU).
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLBM_ENABLE_CUDA=ON \
+            -DLBM_BUILD_APPS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+
+      - name: Build
+        run: cmake --build build --target lbm_gpu_tests lbm_poiseuille_gpu_tests -j3
+
+      # The exact CPU-vs-GPU comparison (all EXPECT_EQ on the raw bits), run in
+      # full. The simulator can print a VirtualGPU error and still exit 0, and
+      # the GPU tests must not be skipped, so the output is checked too.
+      - name: Test CPU-vs-GPU step
+        run: |
+          set -o pipefail
+          vgpu run ./build/tests/lbm_gpu_tests 2>&1 | tee step.log
+          ! grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" step.log
+          grep -F "[       OK ] StepGpuP16.ConversionMatchesHostBitwise" step.log
+          grep -F "[       OK ] StepGpu/1.HundredStepsForcedMatchesCpu" step.log
+          grep -E "\[  PASSED  \] [0-9]+ tests" step.log
+
+      # The GPU Poiseuille validation (double, float and 16-bit storage), all
+      # cases, against the analytic profile within the derived tolerances.
+      - name: Test GPU Poiseuille
+        run: |
+          set -o pipefail
+          vgpu run ./build/tests/lbm_poiseuille_gpu_tests 2>&1 | tee poiseuille.log
+          ! grep -i -E "VirtualGPU error|no CUDA-capable device|no device|SKIPPED|FAILED" poiseuille.log
+          grep -F "[       OK ] Channel/PoiseuilleGpu.MatchesShiftedParabola/H16_nu0_5_lambda0_1875" poiseuille.log
+          grep -F "[       OK ] Channel/PoiseuilleGpuFloat.MatchesShiftedParabola/H8_nu0_5_lambda0_1875" poiseuille.log
+          grep -F "[       OK ] Channel/PoiseuilleGpuP16.MatchesShiftedParabola/H8_nu0_5_lambda0_1875" poiseuille.log
+          grep -E "\[  PASSED  \] 33 tests" poiseuille.log
